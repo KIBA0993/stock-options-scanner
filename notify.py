@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notify.py — Trade Alert Notifier (Week 4)
+notify.py — Trade Alert Notifier (Week 4 + 6)
 
 Reads data/alerts.json, deduplicates against sent history, and delivers
 new alerts via Telegram and/or email.
@@ -9,11 +9,11 @@ Pipeline:
   scanner.py → all_data.json → orchestrate.py → alerts.json → notify.py
 
 Usage:
-  python notify.py                # send new alerts (Telegram + email if configured)
-  python notify.py --dry-run      # format and print messages without sending
-  python notify.py --force        # resend all alerts (ignore deduplication)
-  python notify.py --channel tg   # Telegram only
-  python notify.py --channel email # email only
+  python notify.py                         # send new alerts (Telegram + email if configured)
+  python notify.py --morning-digest        # always send a daily market-open email (even if no trades)
+  python notify.py --dry-run               # format and print messages without sending
+  python notify.py --force                 # resend all alerts (ignore deduplication)
+  python notify.py --channel email         # email only
 
 Setup (add to config.json):
   Telegram:
@@ -46,7 +46,7 @@ import json
 import logging
 import smtplib
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from logging.handlers import TimedRotatingFileHandler
@@ -58,6 +58,7 @@ DATA_DIR     = BASE_DIR / "data"
 LOG_DIR      = BASE_DIR / "logs"
 CONFIG_PATH  = BASE_DIR / "config.json"
 ALERTS_PATH  = DATA_DIR / "alerts.json"
+BUDGET_PATH  = DATA_DIR / "budget.json"
 SENT_PATH    = DATA_DIR / "sent_history.json"   # deduplication log
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -203,77 +204,189 @@ def format_telegram_summary(
     )
 
 
-def format_email_html(alerts: list[dict], scan_ts: str, context: Optional[str]) -> str:
-    """Format alerts as an HTML email body."""
+def _load_budget_for_display(config: dict) -> dict:
+    """Load budget info for inclusion in digest emails."""
+    weekly_max  = config.get("budget", {}).get("weekly_trade_max", 5)
+    total_usd   = config.get("budget", {}).get("total_usd", 500)
+    per_trade   = round(total_usd / weekly_max) if weekly_max else total_usd
+    used        = 0
+    remaining   = weekly_max
+    week_start  = date.today().isoformat()
+
+    if BUDGET_PATH.exists():
+        try:
+            with open(BUDGET_PATH) as f:
+                b = json.load(f)
+            used      = b.get("surfaced_this_week", 0)
+            remaining = max(0, weekly_max - used)
+            week_start = b.get("week_start", week_start)
+        except Exception:
+            pass
+
+    return {
+        "weekly_max":  weekly_max,
+        "total_usd":   total_usd,
+        "per_trade":   per_trade,
+        "used":        used,
+        "remaining":   remaining,
+        "week_start":  week_start,
+    }
+
+
+def _alert_card_html(a: dict) -> str:
+    """Render a single alert as an HTML card."""
+    direction = a["direction"].upper()
+    dir_color = "#1a7f37" if direction == "CALL" else "#cf222e"
+    dir_bg    = "#dafbe1" if direction == "CALL" else "#ffebe9"
+    score_pct = int(a["score"] * 100)
+    risk      = a.get("risk_level", "?")
+    dte       = a.get("suggested_dte") or "see rationale"
+    creators  = " ".join(f"@{c}" for c in a.get("supporting_creators", [])) or "heuristic"
+    signals   = "".join(f"<li>{s}</li>" for s in a.get("key_signals", [])[:5])
+    rationale = a.get("rationale", "")
+    method    = "LLM" if a.get("scoring_method") == "llm" else "Heuristic"
+    size_hint = a.get("position_size_hint", "")
+    size_line = (f'<div style="margin:6px 0; font-size:13px; color:#1a7f37; font-weight:600;">'
+                 f'💰 Suggested size: {size_hint}</div>') if size_hint else ""
+
+    return f"""
+    <div style="border:1px solid #d0d7de; border-radius:8px; padding:16px;
+                margin-bottom:16px; font-family:system-ui,sans-serif;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:22px; font-weight:700;">{a['symbol']}</span>
+        <span style="background:{dir_bg}; color:{dir_color}; font-weight:700;
+                     padding:4px 12px; border-radius:12px; font-size:14px;">
+          {direction}
+        </span>
+      </div>
+      <div style="margin:8px 0; color:#57606a; font-size:14px;">
+        Score: <b>{score_pct}%</b> &nbsp;│&nbsp; Risk: <b>{risk}</b>
+        &nbsp;│&nbsp; DTE: <b>{dte}</b> &nbsp;│&nbsp; Scoring: {method}
+      </div>
+      <div style="margin:8px 0; font-size:13px; color:#57606a;">
+        Frameworks: {creators}
+      </div>
+      {size_line}
+      <p style="font-size:14px; color:#24292f; margin:8px 0;">{rationale}</p>
+      <ul style="font-size:13px; color:#57606a; margin:4px 0; padding-left:20px;">
+        {signals}
+      </ul>
+    </div>
+    """
+
+
+def _budget_html(bud: dict) -> str:
+    bar_pct = int(bud["used"] / bud["weekly_max"] * 100) if bud["weekly_max"] else 0
+    bar_color = "#2da44e" if bar_pct < 60 else ("#d29922" if bar_pct < 100 else "#cf222e")
+    return f"""
+    <div style="border:1px solid #d0d7de; border-radius:8px; padding:12px 16px;
+                margin-bottom:16px; background:#f6f8fa; font-family:system-ui,sans-serif;">
+      <div style="font-size:13px; color:#57606a; margin-bottom:6px;">
+        Weekly budget &nbsp;│&nbsp; ${bud['total_usd']} total
+        &nbsp;│&nbsp; ~${bud['per_trade']}/trade &nbsp;│&nbsp; week of {bud['week_start']}
+      </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div style="flex:1; background:#e1e4e8; border-radius:4px; height:8px;">
+          <div style="width:{bar_pct}%; background:{bar_color}; height:8px; border-radius:4px;"></div>
+        </div>
+        <span style="font-size:13px; font-weight:600; color:{bar_color};">
+          {bud['used']}/{bud['weekly_max']} trades used
+        </span>
+      </div>
+    </div>
+    """
+
+
+def format_email_html(
+    alerts: list[dict],
+    scan_ts: str,
+    context: Optional[str],
+    config: Optional[dict] = None,
+    morning_digest: bool = False,
+) -> str:
+    """Format alerts (or a no-trade digest) as an HTML email body."""
     scan_dt = scan_ts[:16].replace("T", " ") if scan_ts else "unknown"
     context_html = f"<p><b>Context:</b> {context}</p>" if context else ""
+    bud = _load_budget_for_display(config or {})
 
-    rows = ""
-    for a in alerts:
-        direction = a["direction"].upper()
-        dir_color = "#1a7f37" if direction == "CALL" else "#cf222e"
-        dir_bg    = "#dafbe1" if direction == "CALL" else "#ffebe9"
-        score_pct = int(a["score"] * 100)
-        risk      = a.get("risk_level", "?")
-        dte       = a.get("suggested_dte") or "see rationale"
-        creators  = " ".join(f"@{c}" for c in a.get("supporting_creators", [])) or "heuristic"
-        signals   = "".join(f"<li>{s}</li>" for s in a.get("key_signals", [])[:5])
-        rationale = a.get("rationale", "")
-        method    = "LLM" if a.get("scoring_method") == "llm" else "Heuristic"
-
-        rows += f"""
-        <div style="border:1px solid #d0d7de; border-radius:8px; padding:16px;
-                    margin-bottom:16px; font-family:system-ui,sans-serif;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:22px; font-weight:700;">{a['symbol']}</span>
-            <span style="background:{dir_bg}; color:{dir_color}; font-weight:700;
-                         padding:4px 12px; border-radius:12px; font-size:14px;">
-              {direction}
-            </span>
-          </div>
-          <div style="margin:8px 0; color:#57606a; font-size:14px;">
-            Score: <b>{score_pct}%</b> &nbsp;│&nbsp; Risk: <b>{risk}</b>
-            &nbsp;│&nbsp; DTE: <b>{dte}</b> &nbsp;│&nbsp; Scoring: {method}
-          </div>
-          <div style="margin:8px 0; font-size:13px; color:#57606a;">
-            Frameworks: {creators}
-          </div>
-          <p style="font-size:14px; color:#24292f; margin:8px 0;">{rationale}</p>
-          <ul style="font-size:13px; color:#57606a; margin:4px 0; padding-left:20px;">
-            {signals}
-          </ul>
+    if morning_digest and not alerts:
+        headline = "📋 Morning Market Digest — No trade signals today"
+        body_html = f"""
+        <div style="border:1px solid #d0d7de; border-radius:8px; padding:20px;
+                    margin-bottom:16px; background:#fff; font-family:system-ui,sans-serif;">
+          <p style="font-size:15px; color:#24292f; margin:0 0 8px 0;">
+            The scanner ran at market open and found <b>no qualifying setups</b> that meet
+            the current scoring threshold.
+          </p>
+          <p style="font-size:13px; color:#57606a; margin:0;">
+            Additional scans are scheduled at <b>12:00 PM</b> and <b>2:30 PM ET</b>.
+            You'll receive an email immediately if a trade signal appears.
+          </p>
         </div>
         """
+    else:
+        n = len(alerts)
+        headline = f"📊 Trade Alert{'s' if n != 1 else ''} — {n} new signal{'s' if n != 1 else ''}"
+        body_html = "".join(_alert_card_html(a) for a in alerts)
 
     return f"""
     <html><body style="background:#f6f8fa; padding:24px; font-family:system-ui,sans-serif;">
       <div style="max-width:600px; margin:0 auto;">
-        <h2 style="color:#24292f;">
-          📊 Trade Alerts — {len(alerts)} signal{'s' if len(alerts) != 1 else ''}
-        </h2>
-        <p style="color:#57606a; font-size:13px;">Scan: {scan_dt} UTC</p>
+        <h2 style="color:#24292f; margin-bottom:4px;">{headline}</h2>
+        <p style="color:#57606a; font-size:13px; margin-top:4px;">
+          Scan: {scan_dt} UTC &nbsp;│&nbsp; {date.today().strftime('%A, %B %-d, %Y')}
+        </p>
         {context_html}
-        {rows}
+        {_budget_html(bud)}
+        {body_html}
         <p style="color:#8c959f; font-size:12px; margin-top:24px;">
           Generated by trading/notify.py &nbsp;│&nbsp;
-          Run <code>trade-scan</code> to refresh
+          Run <code>trade-scan</code> to refresh anytime
         </p>
       </div>
     </body></html>
     """
 
 
-def format_email_text(alerts: list[dict], scan_ts: str, context: Optional[str]) -> str:
+def format_email_text(
+    alerts: list[dict],
+    scan_ts: str,
+    context: Optional[str],
+    config: Optional[dict] = None,
+    morning_digest: bool = False,
+) -> str:
     """Plain-text fallback for email."""
     scan_dt = scan_ts[:16].replace("T", " ") if scan_ts else "unknown"
-    lines = [f"TRADE ALERTS — {scan_dt} UTC"]
+    bud = _load_budget_for_display(config or {})
+
+    if morning_digest and not alerts:
+        lines = [
+            f"MORNING MARKET DIGEST — {scan_dt} UTC",
+            f"Week of {bud['week_start']} | Budget: {bud['used']}/{bud['weekly_max']} trades used",
+            "=" * 50,
+            "",
+            "No qualifying trade setups found at market open.",
+            "Additional scans scheduled at 12:00 PM and 2:30 PM ET.",
+            "You will receive an email immediately if a signal appears.",
+        ]
+        return "\n".join(lines)
+
+    lines = [
+        f"TRADE ALERTS — {scan_dt} UTC",
+        f"Week of {bud['week_start']} | Budget: {bud['used']}/{bud['weekly_max']} trades | ~${bud['per_trade']}/trade",
+    ]
     if context:
         lines.append(f"Context: {context}")
     lines.append("=" * 50)
     for a in alerts:
+        size_hint = a.get("position_size_hint", "")
         lines += [
             f"\n{a['symbol']} — {a['direction'].upper()}",
             f"Score: {int(a['score']*100)}%  Risk: {a.get('risk_level')}  DTE: {a.get('suggested_dte')}",
+        ]
+        if size_hint:
+            lines.append(f"Suggested size: {size_hint}")
+        lines += [
             f"Rationale: {a.get('rationale')}",
             "Signals:",
         ]
@@ -338,14 +451,16 @@ def send_telegram(
 
 # ─── Email Delivery ────────────────────────────────────────────────────────────
 def send_email(
-    alerts:  list[dict],
-    scan_ts: str,
-    context: Optional[str],
-    em_cfg:  dict,
-    dry_run: bool,
+    alerts:         list[dict],
+    scan_ts:        str,
+    context:        Optional[str],
+    em_cfg:         dict,
+    dry_run:        bool,
+    config:         Optional[dict] = None,
+    morning_digest: bool = False,
 ) -> bool:
-    """Send alert digest via SMTP. Returns True on success."""
-    smtp_host = em_cfg.get("smtp_host", "")
+    """Send alert digest (or morning no-trade digest) via SMTP. Returns True on success."""
+    smtp_host = em_cfg.get("smtp_host", "smtp.gmail.com")
     smtp_port = int(em_cfg.get("smtp_port", 587))
     smtp_user = em_cfg.get("smtp_user", "")
     smtp_pass = em_cfg.get("smtp_password", "")
@@ -355,16 +470,20 @@ def send_email(
         logger.warning("Email SMTP credentials not set in config.json — skipping")
         return False
 
-    n = len(alerts)
-    subject = f"📊 {n} Trade Alert{'s' if n != 1 else ''} — {scan_ts[:10]}"
+    today_str = date.today().strftime("%a %b %-d")
+    if morning_digest and not alerts:
+        subject = f"📋 Morning Digest — No trades today ({today_str})"
+    else:
+        n = len(alerts)
+        subject = f"📊 {n} Trade Alert{'s' if n != 1 else ''} — {today_str}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = smtp_user
     msg["To"]      = to_addr
 
-    plain = format_email_text(alerts, scan_ts, context)
-    html  = format_email_html(alerts, scan_ts, context)
+    plain = format_email_text(alerts, scan_ts, context, config=config, morning_digest=morning_digest)
+    html  = format_email_html(alerts, scan_ts, context, config=config, morning_digest=morning_digest)
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(html,  "html"))
 
@@ -449,6 +568,8 @@ def print_no_alerts() -> None:
 # ─── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(description="Trade Alert Notifier")
+    parser.add_argument("--morning-digest", action="store_true",
+                        help="Always send an email (even if no trades) — used by 9:40 AM launchd job")
     parser.add_argument("--dry-run", action="store_true",
                         help="Format and print messages without sending")
     parser.add_argument("--force",   action="store_true",
@@ -467,18 +588,59 @@ def main() -> None:
     em_enabled  = em_cfg.get("enabled", False)
     any_enabled = tg_enabled or em_enabled
 
-    # Load alerts
-    data      = load_alerts()
-    all_alerts = data.get("alerts", [])
-    scan_ts   = data.get("scan_timestamp", "")
-    context   = data.get("context")
+    # Load alerts (may not exist yet on a fresh install — tolerate gracefully)
+    if not ALERTS_PATH.exists() and not args.morning_digest:
+        logger.error(
+            f"alerts.json not found at {ALERTS_PATH}.\n"
+            "  Run the full pipeline first: trade-scan"
+        )
+        sys.exit(1)
+
+    all_alerts: list[dict] = []
+    scan_ts = datetime.now(timezone.utc).isoformat()
+    context: Optional[str] = None
+
+    if ALERTS_PATH.exists():
+        data       = load_alerts()
+        all_alerts = data.get("alerts", [])
+        scan_ts    = data.get("scan_timestamp", scan_ts)
+        context    = data.get("context")
 
     logger.info(f"Loaded {len(all_alerts)} alert(s) from alerts.json")
 
+    # ── Morning digest: always send even if 0 new alerts ────────────────────
+    if args.morning_digest:
+        if not any_enabled and not args.dry_run:
+            print_setup_guide(config)
+            return
+
+        history    = load_sent_history()
+        new_alerts = filter_new_alerts(all_alerts, scan_ts, history, force=args.force)
+
+        sent_channels: list[str] = []
+        if args.channel in ("email", "all") and (em_enabled or args.dry_run):
+            ok = send_email(
+                new_alerts, scan_ts, context, em_cfg,
+                dry_run=args.dry_run, config=config, morning_digest=True,
+            )
+            if ok:
+                sent_channels.append("email")
+
+        if args.channel in ("telegram", "all") and tg_enabled and new_alerts:
+            ok = send_telegram(new_alerts, scan_ts, context, tg_cfg, dry_run=args.dry_run)
+            if ok:
+                sent_channels.append("telegram")
+
+        if sent_channels and not args.dry_run and new_alerts:
+            record_sent(new_alerts, scan_ts, sent_channels)
+
+        print(f"\n  ✓ Morning digest sent ({len(new_alerts)} trade alert(s)) via {sent_channels or ['(none)']}")
+        return
+
+    # ── Normal flow (opportunity alerts) ────────────────────────────────────
     if not any_enabled and not args.dry_run:
         if all_alerts:
             print_setup_guide(config)
-            # Still print a preview in the terminal
             print("  Alert preview (not sent — no channels configured):\n")
             for a in all_alerts:
                 print(format_telegram(a, scan_ts, context))
@@ -487,7 +649,6 @@ def main() -> None:
             print_no_alerts()
         return
 
-    # Deduplication
     history    = load_sent_history()
     new_alerts = filter_new_alerts(all_alerts, scan_ts, history, force=args.force)
 
@@ -497,10 +658,9 @@ def main() -> None:
 
     logger.info(f"Sending {len(new_alerts)} new alert(s) …")
 
-    sent_channels: list[str] = []
+    sent_channels = []
     success = True
 
-    # Telegram
     if args.channel in ("telegram", "all") and (tg_enabled or args.dry_run):
         ok = send_telegram(new_alerts, scan_ts, context, tg_cfg, dry_run=args.dry_run)
         if ok:
@@ -508,15 +668,16 @@ def main() -> None:
         else:
             success = False
 
-    # Email
     if args.channel in ("email", "all") and (em_enabled or args.dry_run):
-        ok = send_email(new_alerts, scan_ts, context, em_cfg, dry_run=args.dry_run)
+        ok = send_email(
+            new_alerts, scan_ts, context, em_cfg,
+            dry_run=args.dry_run, config=config, morning_digest=False,
+        )
         if ok:
             sent_channels.append("email")
         else:
             success = False
 
-    # If no channels fired (not enabled, not dry-run), show setup guide
     if not sent_channels and not args.dry_run:
         print_setup_guide(config)
         print("  Alert preview:\n")
@@ -525,11 +686,9 @@ def main() -> None:
             print()
         return
 
-    # Record sent alerts (only if actually sent, not dry-run)
     if sent_channels and not args.dry_run:
         record_sent(new_alerts, scan_ts, sent_channels)
 
-    # Summary
     print(f"\n{'─'*60}")
     if args.dry_run:
         print(f"  [DRY RUN] Would send {len(new_alerts)} alert(s)")

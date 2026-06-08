@@ -698,14 +698,27 @@ def filter_alerts(
     scored:     list[dict],
     min_score:  float,
     max_alerts: int,
+    config:     Optional[dict] = None,
 ) -> list[dict]:
-    """Keep only actionable alerts above threshold, sorted by score."""
+    """Keep only actionable alerts above threshold, sorted by score.
+    Attaches position_size_hint based on budget config."""
     actionable = [
         s for s in scored
         if s["score"] >= min_score and s["direction"] != "skip"
     ]
     actionable.sort(key=lambda x: x["score"], reverse=True)
-    return actionable[:max_alerts]
+    alerts = actionable[:max_alerts]
+
+    # Attach per-trade size hint
+    cfg_bud    = (config or {}).get("budget", {})
+    total_usd  = cfg_bud.get("total_usd", 500)
+    weekly_max = cfg_bud.get("weekly_trade_max", 5)
+    per_trade  = round(total_usd / weekly_max) if weekly_max else 100
+
+    for a in alerts:
+        a["position_size_hint"] = f"~${per_trade} (1/{weekly_max} of ${total_usd} budget)"
+
+    return alerts
 
 
 # ─── Output ────────────────────────────────────────────────────────────────────
@@ -852,7 +865,7 @@ def main() -> None:
         else:
             s["would_have_direction"] = s.get("direction")
 
-    alerts = filter_alerts(all_scored, min_score, max_alerts)
+    alerts = filter_alerts(all_scored, min_score, max_alerts, config=config)
 
     # ── Archive full scored output for reflect.py ─────────────────────────────
     if not args.dry_run:

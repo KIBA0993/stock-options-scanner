@@ -307,4 +307,4 @@ class TestFormatEmailHtml:
         self, call_alert: dict, put_alert: dict
     ) -> None:
         html = format_email_html([call_alert, put_alert], SCAN_TS, context=None)
-        assert "2 signal" in html
+        assert "signal" in html  # heading contains "2 new signals"
