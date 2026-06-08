@@ -368,6 +368,8 @@ def get_specific_tickers(symbols: list[str]) -> tuple[list[dict], bool]:
     """
     from tradingview_screener import Query, Column
     try:
+        # NOTE: Column("ticker").isin() with OR breaks the query — use name-based filter only.
+        # The screener's `name` column holds the bare ticker symbol (e.g. "MU", "MRVL").
         _count, df = (
             Query()
             .set_markets("america")
@@ -377,11 +379,7 @@ def get_specific_tickers(symbols: list[str]) -> tuple[list[dict], bool]:
                 "RSI", "MACD.macd", "MACD.signal",
                 "EMA20", "EMA50", "EMA200", "Recommend.All",
             )
-            .where(Column("name").isin(symbols) | Column("ticker").isin(
-                [f"NASDAQ:{s}" for s in symbols] +
-                [f"NYSE:{s}" for s in symbols] +
-                [f"AMEX:{s}" for s in symbols]
-            ))
+            .where(Column("name").isin(symbols))
             .limit(len(symbols) * 3)
             .get_scanner_data()
         )
@@ -455,6 +453,37 @@ def get_specific_tickers(symbols: list[str]) -> tuple[list[dict], bool]:
                     c["change_pct"] = yf["change_pct"]
 
     return candidates, False
+
+
+def _fetch_ohlcv_30d(symbols: list[str]) -> dict[str, list]:
+    """Fetch last 30 trading days of OHLCV from yfinance for a list of symbols."""
+    result: dict[str, list] = {}
+    try:
+        import yfinance as yf
+        data = yf.download(symbols, period="45d", interval="1d",
+                           auto_adjust=True, progress=False, group_by="ticker")
+        # Handle single vs multi-ticker download shape
+        for sym in symbols:
+            try:
+                df = data[sym] if len(symbols) > 1 else data
+                df = df.dropna(how="all").tail(30)
+                bars = []
+                for idx in df.itertuples():
+                    ts = str(idx.Index.date()) if hasattr(idx.Index, "date") else str(idx.Index)
+                    bars.append({
+                        "date":   ts,
+                        "open":   round(float(idx.Open),  4),
+                        "high":   round(float(idx.High),  4),
+                        "low":    round(float(idx.Low),   4),
+                        "close":  round(float(idx.Close), 4),
+                        "volume": int(idx.Volume),
+                    })
+                result[sym.upper()] = bars
+            except Exception as exc:
+                logger.debug(f"OHLCV parse failed for {sym}: {exc}")
+    except Exception as exc:
+        logger.warning(f"OHLCV batch download failed: {exc}")
+    return result
 
 
 def _calc_rsi(closes: list[float], period: int = 14) -> Optional[float]:
@@ -531,6 +560,19 @@ def _get_tickers_via_yfinance(symbols: list[str]) -> list[dict]:
             ema200 = _calc_ema(closes, 200)
             macd, macd_sig = _calc_macd(closes)
 
+            # Last 30 OHLCV bars for backtest.py and reflect.py
+            ohlcv_30d = []
+            for idx in hist.tail(30).itertuples():
+                ts = str(idx.Index.date()) if hasattr(idx.Index, "date") else str(idx.Index)
+                ohlcv_30d.append({
+                    "date":   ts,
+                    "open":   round(float(idx.Open), 4),
+                    "high":   round(float(idx.High), 4),
+                    "low":    round(float(idx.Low),  4),
+                    "close":  round(float(idx.Close), 4),
+                    "volume": int(idx.Volume),
+                })
+
             results.append({
                 "symbol": sym.upper(), "tv_ticker": f"yf:{sym.upper()}",
                 "name": sym.upper(), "price": price, "change_pct": chg_1d,
@@ -538,6 +580,7 @@ def _get_tickers_via_yfinance(symbols: list[str]) -> list[dict]:
                 "rsi": rsi, "macd": macd, "macd_signal": macd_sig,
                 "ema20": ema20, "ema50": ema50, "ema200": ema200,
                 "tv_recommendation": None,
+                "ohlcv_30d": ohlcv_30d,
             })
         except Exception as exc:
             logger.warning(f"yfinance fallback failed for {sym}: {exc}")
@@ -591,6 +634,10 @@ def main() -> None:
     # Step 5: 5-day returns (for reflect.py pattern detection)
     logger.info(f"Fetching 5-day returns for: {symbols}")
     returns_5d = get_5day_returns(symbols)
+
+    # Step 5b: Last-30-day OHLCV (for backtest.py; skip if already in candidate from yfinance path)
+    logger.info(f"Fetching 30-day OHLCV for: {symbols}")
+    ohlcv_map = _fetch_ohlcv_30d(symbols)
 
     # Step 6: Drop tickers with no listed options (skip in --symbols mode — user asked explicitly)
     if not args.symbols:
@@ -646,8 +693,8 @@ def main() -> None:
                 "calls": od.get("calls", []),
                 "puts":  od.get("puts", []),
             },
-            # Placeholders for Week 4 additions
-            "ohlcv":    [],
+            # Last 30 days of OHLCV for backtest / reflect.py pattern validation
+            "ohlcv":    c.get("ohlcv_30d") or ohlcv_map.get(sym, []),
             # News
             "news": news.get(sym, []),
         })
@@ -675,12 +722,36 @@ def _ema_alignment(ema20: Optional[float], ema50: Optional[float],
     return "neutral"
 
 
+def _market_session_note() -> str:
+    """Return a note about expected data characteristics based on time of day (ET)."""
+    import pytz
+    try:
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+    except Exception:
+        return ""
+    h, m = et_now.hour, et_now.minute
+    minutes_since_open = (h - 9) * 60 + m - 30  # minutes since 9:30 AM ET
+    if h < 9 or (h == 9 and m < 30):
+        return "Pre-market scan: relative_volume will be near-zero — do NOT penalize low relative_volume."
+    if 0 <= minutes_since_open < 30:
+        return (
+            f"Early session ({minutes_since_open}min since open): relative_volume is characteristically "
+            "low in the first 30 minutes. Do NOT use low relative_volume as a bearish signal."
+        )
+    if minutes_since_open < 90:
+        return f"Mid-morning session ({minutes_since_open}min since open): volume still building."
+    if h >= 15 and m >= 30:
+        return "Near close: volume surge normal. Confirm direction aligns with day's trend."
+    return ""
+
+
 def _write_output(ticker_records: list, context: Optional[str], had_errors: bool) -> None:
     output = {
-        "scan_timestamp": datetime.now(timezone.utc).isoformat(),
-        "data_quality":   "partial" if had_errors else "complete",
-        "context":        context,
-        "tickers":        ticker_records,
+        "scan_timestamp":    datetime.now(timezone.utc).isoformat(),
+        "data_quality":      "partial" if had_errors else "complete",
+        "context":           context,
+        "market_session_note": _market_session_note(),
+        "tickers":           ticker_records,
     }
     out_path = DATA_DIR / "all_data.json"
     out_path.write_text(json.dumps(output, indent=2, default=str))

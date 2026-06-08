@@ -267,6 +267,7 @@ CURRENT MARKET CANDIDATES:
 {tickers_text}
 
 MARKET CONTEXT: {context}
+SESSION NOTE: {session_note}
 
 Evaluate each candidate. Return ONLY this exact JSON:
 
@@ -336,10 +337,11 @@ def _ollama_available() -> bool:
 
 
 def llm_score(
-    tickers:    list[dict],
-    frameworks: list[dict],
-    config:     dict,
-    context:    Optional[str],
+    tickers:      list[dict],
+    frameworks:   list[dict],
+    config:       dict,
+    context:      Optional[str],
+    session_note: str = "",
 ) -> list[dict]:
     """Score candidates via Anthropic / OpenAI / Ollama. Returns [] on failure."""
     llm_cfg  = config.get("llm", {})
@@ -375,6 +377,7 @@ def llm_score(
         frameworks_text="\n\n".join(fw_parts),
         tickers_text="\n\n---\n\n".join(tk_parts),
         context=context or "No specific context provided.",
+        session_note=session_note or "Regular market hours.",
     )
 
     active_provider = "ollama" if use_ollama else provider
@@ -671,18 +674,23 @@ def score_candidates(
     frameworks:      list[dict],
     config:          dict,
     context:         Optional[str],
+    session_note:    str = "",
     force_heuristic: bool = False,
 ) -> list[dict]:
     """Score all candidates. Use LLM when available, fall back per-ticker."""
     llm_results: list[dict] = []
     if not force_heuristic:
-        llm_results = llm_score(tickers, frameworks, config, context)
+        llm_results = llm_score(tickers, frameworks, config, context,
+                                session_note=session_note)
 
     llm_map: dict[str, dict] = {}
     for ev in llm_results:
         sym = ev.get("symbol", "").upper()
         if sym:
             ev["scoring_method"] = "llm"
+            # Normalise: the prompt uses `risk_level`; `conviction` is the canonical field name
+            if ev.get("conviction") is None and ev.get("risk_level"):
+                ev["conviction"] = ev["risk_level"]
             llm_map[sym] = ev
 
     scored: list[dict] = []
@@ -1039,9 +1047,10 @@ def main() -> None:
         max_alerts = min(max_alerts, remaining)
         logger.info(f"Budget: {used}/{WEEKLY_BUDGET} used, {remaining} remaining this week")
 
-    all_data   = load_all_data()
-    tickers    = all_data.get("tickers", [])
-    context    = all_data.get("context")
+    all_data     = load_all_data()
+    tickers      = all_data.get("tickers", [])
+    context      = all_data.get("context")
+    session_note = all_data.get("market_session_note", "")
 
     if not tickers:
         print("\nNo candidates from scanner output — nothing to score.")
@@ -1056,6 +1065,7 @@ def main() -> None:
 
     all_scored = score_candidates(
         tickers, frameworks, config, context,
+        session_note=session_note,
         force_heuristic=args.no_llm,
     )
 
