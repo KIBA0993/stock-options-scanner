@@ -44,5 +44,9 @@
     "pre_filter_top_n": 5,
     "min_score": 0.60,
     "max_daily_candidates": 2
+  },
+  "options": {
+    "preferred_dte": "7-14 days",
+    "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget"
   }
 }

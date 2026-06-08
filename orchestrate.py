@@ -299,7 +299,8 @@ SCORING GUIDE:
 RULES:
 1. direction must be "call", "put", or "skip" (exact string)
 2. risk_level must be "low", "medium", or "high" (exact string)
-3. suggested_dte examples: "0-2 days", "7-14 days", "14-30 days", "30+ days"
+3. suggested_dte: default to "{preferred_dte}" unless the setup clearly needs more time.
+   Examples: "0-2 days", "7-14 days", "14-30 days", "30+ days"
 4. If direction = "skip" → set score ≤ 0.39, fill skip_reason, entry/stop/target may be null
 5. Check Red Flags for each creator — any match reduces score to ≤ 0.4
 6. kpak82 trades REVERSALS at extremes, NOT momentum chasing
@@ -373,11 +374,13 @@ def llm_score(
     ]
     tk_parts = [_ticker_summary(t) for t in tickers]
 
+    preferred_dte = (config or {}).get("options", {}).get("preferred_dte", "7-14 days")
     prompt = LLM_PROMPT.format(
         frameworks_text="\n\n".join(fw_parts),
         tickers_text="\n\n---\n\n".join(tk_parts),
         context=context or "No specific context provided.",
         session_note=session_note or "Regular market hours.",
+        preferred_dte=preferred_dte,
     )
 
     active_provider = "ollama" if use_ollama else provider
@@ -707,17 +710,16 @@ def score_candidates(
 
 
 # ─── Filtering & Ranking ───────────────────────────────────────────────────────
-def _parse_dte_range(dte_hint: Optional[str]) -> tuple[int, int]:
-    """Parse '14-30 days' → (14, 30). Fallback: (7, 45)."""
-    if not dte_hint:
-        return 7, 45
-    nums = re.findall(r"\d+", dte_hint)
+def _parse_dte_range(dte_hint: Optional[str], config: Optional[dict] = None) -> tuple[int, int]:
+    """Parse '7-14 days' → (7, 14). Falls back to config preferred_dte, then 7-14."""
+    hint = dte_hint or (config or {}).get("options", {}).get("preferred_dte") or "7-14 days"
+    nums = re.findall(r"\d+", hint)
     if len(nums) >= 2:
         return int(nums[0]), int(nums[1])
     if len(nums) == 1:
         n = int(nums[0])
         return max(1, n - 7), n + 7
-    return 7, 45
+    return 7, 14
 
 
 def pick_option_contract(
@@ -728,6 +730,7 @@ def pick_option_contract(
     dte_hint:      Optional[str],
     budget:        float,
     all_data:      Optional[dict] = None,
+    config:        Optional[dict] = None,
 ) -> dict:
     """
     Return 3 contract tiers for each alert: ATM, slightly OTM, affordable OTM.
@@ -743,7 +746,7 @@ def pick_option_contract(
 
     Falls back to a live yfinance fetch when the stored chain has stale prices.
     """
-    dte_min, dte_max = _parse_dte_range(dte_hint)
+    dte_min, dte_max = _parse_dte_range(dte_hint, config)
     today = date.today()
     raw_contracts = options_chain.get("calls" if direction == "call" else "puts", [])
 
@@ -1139,6 +1142,7 @@ def main() -> None:
                 options_chain = chain_by_sym.get(sym, {}),
                 dte_hint      = alert.get("suggested_dte"),
                 budget        = total_budget,   # informational only — never filters
+                config        = config,
             )
             alert["recommended_contract"] = contract
             if contract.get("cost_per_contract"):

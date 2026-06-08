@@ -1,0 +1,39 @@
+{
+  "llm": {
+    "provider": "mammouth",
+    "model": "claude-sonnet-4-6",
+    "api_key": "sk-N6lMkU86sTw_GwUR7ZmaEw",
+    "ollama_model": "qwen2.5:14b",
+    "max_tokens": 4096
+  },
+  "budget": {
+    "total_usd": 500,
+    "weekly_trade_max": 5
+  },
+  "notifications": {
+    "telegram": { "enabled": false, "bot_token": "", "chat_id": "" },
+    "email": {
+      "enabled": true,
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "smtp_user": "simonchen0993@gmail.com",
+      "smtp_password": "kpge ixko hpav nkwr",
+      "to": "simonchen0993@gmail.com"
+    }
+  },
+  "x_api": {
+    "bearer_token": "AAAAAAAAAAAAAAAAAAAAABYM%2BAEAAAAAIlqBjrWoXve7sy46fUNOkYK8Kdg%3D9Qlgr2IELyh4Cpl6TRIRezuGqYm4zHyeI2gDVGqBzO6RQYzAGQ"
+  },
+  "scan": {
+    "min_price": 10.0,
+    "min_total_volume": 500000,
+    "earnings_buffer_hours": 48,
+    "pre_filter_top_n": 15,
+    "min_score": 0.60,
+    "max_daily_candidates": 2
+  },
+  "options": {
+    "preferred_dte": "7-14 days",
+    "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget"
+  }
+}
