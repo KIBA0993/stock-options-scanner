@@ -87,17 +87,19 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
       tv_recommendation
     """
     scan = config.get("scan", {})
-    min_rel_vol   = scan.get("min_relative_volume", 2.0)
     min_price     = scan.get("min_price", 10.0)
-    min_vol       = scan.get("min_total_volume", 2_000_000)
+    min_vol       = scan.get("min_total_volume", 500_000)   # liquidity floor only
     top_n         = scan.get("pre_filter_top_n", 10)
+    # min_relative_volume is kept in config for reference/logging but no longer
+    # used as a hard gate — it's passed to the LLM as a signal instead.
+    min_rel_vol_note = scan.get("min_relative_volume", 1.5)
 
     # Only listed exchanges that have options markets — excludes OTC/pink sheets
     LISTED_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSE ARCA", "NYSE MKT"}
 
     logger.info(
-        f"Scanning US stocks (rel_vol>{min_rel_vol}x, price>${min_price}, "
-        f"vol>{min_vol:,}, exchanges={sorted(LISTED_EXCHANGES)})..."
+        f"Scanning US stocks (price>${min_price}, vol>{min_vol:,}, "
+        f"rel_vol is a signal not a gate — exchanges={sorted(LISTED_EXCHANGES)})..."
     )
     try:
         count, df = (
@@ -121,7 +123,8 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
             .where(
                 Column("volume") > min_vol,
                 Column("close") > min_price,
-                Column("relative_volume_10d_calc") > min_rel_vol,
+                # No relative_volume gate — catches pre-breakout and catalyst setups
+                # that haven't yet shown a volume spike.
             )
             .order_by("relative_volume_10d_calc", ascending=False)
             .limit(top_n * 3)   # fetch extra to absorb OTC drop-offs

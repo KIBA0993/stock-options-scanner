@@ -3,6 +3,14 @@
     "total_usd": 500,
     "weekly_trade_max": 5
   },
+  "scan": {
+    "min_price": 10.0,
+    "min_total_volume": 500000,
+    "earnings_buffer_hours": 48,
+    "pre_filter_top_n": 15,
+    "min_score": 0.60,
+    "max_daily_candidates": 2
+  },
   "llm": {
     "provider": "mammouth",
     "model": "claude-sonnet-4-6",
