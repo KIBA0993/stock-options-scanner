@@ -748,12 +748,12 @@ def pick_option_contract(
     raw_contracts = options_chain.get("calls" if direction == "call" else "puts", [])
 
     def _mid(c: dict) -> float:
-        bid  = float(c.get("bid")  or 0)
-        ask  = float(c.get("ask")  or 0)
-        last = float(c.get("lastPrice") or c.get("last") or 0)
+        """Use live bid/ask mid ONLY. Never fall back to lastPrice — it's yesterday's close."""
+        bid = float(c.get("bid") or 0)
+        ask = float(c.get("ask") or 0)
         if bid > 0.01 and ask > 0.01:
             return round((bid + ask) / 2, 2)
-        return last if last > 0.05 else 0.0
+        return 0.0   # treat as no live quote
 
     def _within_dte(exp: str) -> bool:
         try:
@@ -769,21 +769,28 @@ def pick_option_contract(
     def _contract_info(c: dict) -> dict:
         strike   = float(c.get("strike", 0) or 0)
         exp      = str(c.get("expiration", ""))
+        bid      = round(float(c.get("bid") or 0), 2)
+        ask      = round(float(c.get("ask") or 0), 2)
         mid      = _mid(c)
         cost     = round(mid * 100, 2)
+        spread   = round(ask - bid, 2)
+        spread_pct = round(spread / mid * 100, 0) if mid > 0 else 0
         vol      = int(c.get("volume") or c.get("vol") or 0)
         oi       = int(c.get("openInterest") or c.get("oi") or 0)
         iv       = c.get("impliedVolatility")
-        iv_pct   = f"{round(float(iv)*100, 1)}%" if iv else "n/a"
+        iv_pct   = f"{round(float(iv)*100, 1)}%" if iv and float(iv) > 0.001 else "n/a"
         dte_days = (date.fromisoformat(exp) - today).days if exp else 0
         otm_pct  = round(_pct_otm(strike), 1)
+        # Flag wide spreads (>25% of mid) as poor fill quality
+        spread_note = f" ⚠ wide spread ({spread_pct:.0f}%)" if spread_pct > 25 else ""
         return {
             "strike": strike, "expiration": exp, "direction": direction,
-            "mid_price": mid, "cost_per_contract": cost,
+            "bid": bid, "ask": ask, "mid_price": mid, "cost_per_contract": cost,
+            "spread": spread, "spread_pct": spread_pct,
             "volume": vol, "open_interest": oi, "iv_pct": iv_pct,
             "dte_days": dte_days, "pct_otm": otm_pct,
             "label": f"${strike:.0f}{direction[0].upper()} {exp} ({dte_days}DTE, {otm_pct:+.1f}%OTM) "
-                     f"mid=${mid} · 1 contract=${cost} · IV={iv_pct} · vol={vol:,}",
+                     f"bid=${bid}/ask=${ask}/mid=${mid} · 1 contract=${cost}{spread_note} · IV={iv_pct} · vol={vol:,}",
         }
 
     # Pull candidates: valid price, DTE in window, strike within 35% of current price
@@ -895,8 +902,8 @@ def _fetch_live_contracts(
         for exp in target_exps[:2]:
             chain = t.option_chain(exp)
             df = chain.calls if direction == "call" else chain.puts
-            # Accept bid>0 OR lastPrice>0 (options settle ~15 min after market open)
-            df = df[(df["bid"] > 0.05) | (df["lastPrice"] > 0.10)].copy()
+            # Require live bid>0 — lastPrice is yesterday's close, not tradeable
+            df = df[df["bid"] > 0.05].copy()
             for _, row in df.iterrows():
                 def _safe_int(v):
                     try:
@@ -913,7 +920,7 @@ def _fetch_live_contracts(
                     "expiration":        exp,
                     "bid":               float(row.get("bid") or 0),
                     "ask":               float(row.get("ask") or 0),
-                    "lastPrice":         float(row.get("lastPrice") or 0),
+                    # intentionally omit lastPrice — it's yesterday's close, not live
                     "volume":            _safe_int(row.get("volume")),
                     "openInterest":      _safe_int(row.get("openInterest")),
                     "impliedVolatility": _safe_float(row.get("impliedVolatility")),
