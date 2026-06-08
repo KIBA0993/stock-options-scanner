@@ -788,14 +788,12 @@ def pick_option_contract(
             ),
         }
 
-    # Score: prefer within budget, closest to ATM, highest volume
+    # Score: best near-ATM liquid contract — budget is informational only, never filters
     def _score(c: dict) -> tuple:
-        cost = _mid(c) * 100
         strike = float(c.get("strike", 0) or 0)
         dist_from_atm = abs(strike - current_price) / current_price
-        in_budget = cost <= budget
         vol = int(c.get("volume") or c.get("vol") or 0)
-        return (not in_budget, dist_from_atm, -vol)
+        return (dist_from_atm, -vol)
 
     best = sorted(candidates, key=_score)[0]
     mid   = _mid(best)
@@ -810,29 +808,10 @@ def pick_option_contract(
     pct_otm = round((strike - current_price) / current_price * 100, 1) if direction == "call" \
               else round((current_price - strike) / current_price * 100, 1)
 
-    within_budget = cost <= budget
     notes = (
         f"${strike:.0f}{direction[0].upper()} exp {exp} ({dte_days}DTE, {pct_otm:+.1f}% OTM)  "
         f"IV={iv_pct}  vol={vol:,}  OI={oi:,}"
     )
-    if not within_budget:
-        cheapest_in_budget = next(
-            (c for c in sorted(candidates, key=lambda c: _mid(c) * 100)
-             if _mid(c) * 100 <= budget), None
-        )
-        if cheapest_in_budget:
-            cb_mid  = _mid(cheapest_in_budget)
-            cb_cost = round(cb_mid * 100, 2)
-            notes += (
-                f"\n⚠ Cheapest within ${budget:.0f}: "
-                f"${cheapest_in_budget['strike']}{direction[0].upper()} "
-                f"@ ${cb_mid} (${cb_cost}/contract) — very deep OTM, high risk"
-            )
-        else:
-            notes += (
-                f"\n⚠ Budget gap: cheapest option = ${cost:.0f}/contract. "
-                f"Consider raising per-trade budget to ${round(cost * 1.1 / 50) * 50:.0f}."
-            )
 
     return {
         "expiration":        exp,
@@ -843,7 +822,6 @@ def pick_option_contract(
         "volume":            vol,
         "open_interest":     oi,
         "iv_pct":            iv_pct,
-        "within_budget":     within_budget,
         "notes":             notes,
     }
 
@@ -917,14 +895,12 @@ def filter_alerts(
     actionable.sort(key=lambda x: x["score"], reverse=True)
     alerts = actionable[:max_alerts]
 
-    # Attach per-trade size hint
-    cfg_bud    = (config or {}).get("budget", {})
-    total_usd  = cfg_bud.get("total_usd", 500)
-    weekly_max = cfg_bud.get("weekly_trade_max", 5)
-    per_trade  = round(total_usd / weekly_max) if weekly_max else 100
+    # Show total budget as context — actual per-trade sizing is user's decision
+    cfg_bud   = (config or {}).get("budget", {})
+    total_usd = cfg_bud.get("total_usd", 500)
 
     for a in alerts:
-        a["position_size_hint"] = f"~${per_trade} (1/{weekly_max} of ${total_usd} budget)"
+        a["position_size_hint"] = f"Total budget: ${total_usd}"
 
     return alerts
 
@@ -988,13 +964,10 @@ def print_results(
             if a.get("target_note"):
                 print(f"     Target   : {a['target_note']}")
             rc = a.get("recommended_contract")
-            if rc:
+            if rc and rc.get("strike"):
                 cost = rc.get("cost_per_contract")
-                flag = "✓" if rc.get("within_budget") else "⚠ over budget"
                 print(f"     Contract : {rc.get('notes','').splitlines()[0]}  "
-                      f"${cost:.0f}/contract  [{flag}]")
-                for extra in rc.get("notes", "").splitlines()[1:]:
-                    print(f"               {extra}")
+                      f"${cost:.0f}/contract")
 
     # Summary of non-alert candidates
     below   = [s for s in all_scored if s["direction"] != "skip" and s not in alerts]
@@ -1092,7 +1065,7 @@ def main() -> None:
     alerts = filter_alerts(all_scored, min_score, max_alerts, config=config)
 
     # ── Pick specific option contracts for each alert ─────────────────────────
-    per_trade_budget = config.get("budget", {}).get("per_trade_usd", 250)
+    total_budget = config.get("budget", {}).get("total_usd", 500)
     # Build a lookup: symbol → options_chain from the raw scan data
     chain_by_sym = {
         t["symbol"]: t.get("options_chain", {})
@@ -1107,15 +1080,14 @@ def main() -> None:
                 current_price = next((t["price"] for t in tickers if t["symbol"] == sym), 0),
                 options_chain = chain_by_sym.get(sym, {}),
                 dte_hint      = alert.get("suggested_dte"),
-                budget        = per_trade_budget,
+                budget        = total_budget,   # informational only — never filters
             )
             alert["recommended_contract"] = contract
             if contract.get("cost_per_contract"):
                 cost = contract["cost_per_contract"]
-                flag = "✓ within budget" if contract["within_budget"] else f"⚠ over ${per_trade_budget:.0f} budget"
                 logger.info(
                     f"Contract for {sym}: {contract.get('notes','').splitlines()[0]}  "
-                    f"${cost:.0f}/contract  {flag}"
+                    f"${cost:.0f}/contract"
                 )
         except Exception as exc:
             logger.warning(f"Contract picker failed for {sym}: {exc}")

@@ -1,8 +1,7 @@
 {
   "budget": {
     "total_usd": 500,
-    "weekly_trade_max": 2,
-    "per_trade_usd": 250
+    "weekly_trade_max": 5
   },
   "llm": {
     "provider": "mammouth",
