@@ -310,31 +310,61 @@ def _alert_card_html(a: dict) -> str:
 
 
 def _contract_html(a: dict) -> str:
-    """Render the recommended option contract block."""
+    """Render the 3-tier option contract block."""
     rc = a.get("recommended_contract")
-    if not rc or not rc.get("strike"):
+    if not rc or not rc.get("tiers"):
         return ""
 
-    cost    = rc.get("cost_per_contract")
+    sym     = a["symbol"]
+    tiers   = rc["tiers"]
     dir_str = rc.get("direction", "").upper()
 
+    tier_configs = [
+        ("atm",        "ATM",         "#0969da", "High delta · most expensive · best fill"),
+        ("slight_otm", "Slight OTM",  "#1a7f37", "Balanced leverage · good for momentum"),
+        ("affordable", "Affordable",  "#9a6700", "Fits small budget · high leverage"),
+    ]
+
+    rows = ""
+    for key, label, color, subtitle in tier_configs:
+        t = tiers.get(key)
+        if not t:
+            continue
+        rows += f"""
+        <tr>
+          <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; width:110px; vertical-align:top;">
+            <span style="font-size:11px; font-weight:700; color:{color}; background:{color}18;
+                         padding:2px 7px; border-radius:4px;">{label}</span>
+            <div style="font-size:10px; color:#57606a; margin-top:3px;">{subtitle}</div>
+          </td>
+          <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; font-size:13px; font-weight:700; color:#24292f;">
+            {sym} ${t['strike']:.0f} {dir_str} · {t['expiration']}
+          </td>
+          <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; font-size:13px; color:#57606a; white-space:nowrap;">
+            <b>1 contract = ${t['cost_per_contract']:.0f}</b>
+            &nbsp;(mid&nbsp;${t['mid_price']}/sh)
+          </td>
+          <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; font-size:12px; color:#57606a;">
+            {t['pct_otm']:+.1f}% OTM · {t['dte_days']}DTE
+            &nbsp;│&nbsp; IV {t['iv_pct']}
+            &nbsp;│&nbsp; vol {t['volume']:,}
+          </td>
+        </tr>"""
+
+    if not rows:
+        return ""
+
     return f"""
-    <div style="background:#f6f8fa; border:1px solid #d0d7de; border-radius:8px;
-                padding:12px 16px; margin-top:10px; font-family:system-ui,sans-serif;">
-      <div style="font-size:11px; font-weight:700; text-transform:uppercase;
-                  letter-spacing:.5px; color:#57606a; margin-bottom:6px;">
-        💎 Recommended Option Contract
+    <div style="margin-top:12px; border:1px solid #d0d7de; border-radius:8px; overflow:hidden;
+                font-family:system-ui,sans-serif;">
+      <div style="background:#f6f8fa; padding:8px 12px; border-bottom:1px solid #d0d7de;
+                  font-size:11px; font-weight:700; text-transform:uppercase;
+                  letter-spacing:.5px; color:#57606a;">
+        💎 Option Contract Options — choose based on your risk appetite
       </div>
-      <div style="font-size:18px; font-weight:700; color:#24292f;">
-        {a['symbol']} ${rc['strike']:.0f} {dir_str} &nbsp;·&nbsp; exp {rc['expiration']}
-      </div>
-      <div style="margin:6px 0; font-size:13px; color:#57606a;">
-        Mid price: <b>${rc['mid_price']}/share</b>
-        &nbsp;│&nbsp; <b>1 contract = ${cost:.0f}</b>
-        &nbsp;│&nbsp; IV: {rc.get('iv_pct','n/a')}
-        &nbsp;│&nbsp; Vol: {rc['volume']:,}
-        &nbsp;│&nbsp; OI: {rc['open_interest']:,}
-      </div>
+      <table style="width:100%; border-collapse:collapse;">
+        {rows}
+      </table>
     </div>
     """
 
@@ -463,14 +493,18 @@ def format_email_text(
         if a.get("target_note"):
             lines.append(f"Target: {a['target_note']}")
         rc = a.get("recommended_contract")
-        if rc and rc.get("strike"):
-            lines.append("--- Recommended Contract ---")
-            lines.append(
-                f"{a['symbol']} ${rc['strike']:.0f}{rc['direction'][0].upper()} "
-                f"exp {rc['expiration']} | mid=${rc['mid_price']} | "
-                f"1 contract=${rc['cost_per_contract']:.0f} | "
-                f"IV={rc.get('iv_pct','n/a')} | Vol={rc['volume']:,}"
-            )
+        if rc and rc.get("tiers"):
+            lines.append("--- Option Contracts (choose your risk tier) ---")
+            sym = a["symbol"]
+            dir_ltr = rc.get("direction","")[0].upper() if rc.get("direction") else ""
+            for key, label in [("atm","ATM"), ("slight_otm","Slight OTM"), ("affordable","Affordable")]:
+                t = rc["tiers"].get(key)
+                if t:
+                    lines.append(
+                        f"  [{label}] {sym} ${t['strike']:.0f}{dir_ltr} {t['expiration']} | "
+                        f"1 contract=${t['cost_per_contract']:.0f} | mid=${t['mid_price']}/sh | "
+                        f"{t['pct_otm']:+.1f}%OTM | IV={t['iv_pct']} | vol={t['volume']:,}"
+                    )
     return "\n".join(lines)
 
 

@@ -730,15 +730,22 @@ def pick_option_contract(
     all_data:      Optional[dict] = None,
 ) -> dict:
     """
-    Select the best option contract for this alert within budget.
+    Return 3 contract tiers for each alert: ATM, slightly OTM, affordable OTM.
 
-    Returns a dict with: expiration, strike, direction, mid_price,
-    cost_per_contract, volume, open_interest, iv, within_budget, notes.
-    Falls back to a live yfinance fetch if the stored chain has no real prices.
+    With a small budget, the right contract often ISN'T the ATM one — OTM
+    options offer high leverage at a fraction of the cost.  All three tiers
+    are shown; the user picks based on their own risk/budget preference.
+
+    Tier definitions (calls; mirrored for puts):
+      ATM      : strike within ±3% of current price  (delta ~0.5, most expensive)
+      Slight OTM: strike 5-12% above price           (delta ~0.3, balanced)
+      Affordable: most liquid contract within budget  (cheapest real option)
+
+    Falls back to a live yfinance fetch when the stored chain has stale prices.
     """
     dte_min, dte_max = _parse_dte_range(dte_hint)
     today = date.today()
-    contracts = options_chain.get("calls" if direction == "call" else "puts", [])
+    raw_contracts = options_chain.get("calls" if direction == "call" else "puts", [])
 
     def _mid(c: dict) -> float:
         bid  = float(c.get("bid")  or 0)
@@ -746,83 +753,120 @@ def pick_option_contract(
         last = float(c.get("lastPrice") or c.get("last") or 0)
         if bid > 0.01 and ask > 0.01:
             return round((bid + ask) / 2, 2)
-        if last > 0.05:
-            return last
-        return 0.0
+        return last if last > 0.05 else 0.0
 
     def _within_dte(exp: str) -> bool:
         try:
-            d = (date.fromisoformat(exp) - today).days
-            return dte_min <= d <= dte_max
+            return dte_min <= (date.fromisoformat(exp) - today).days <= dte_max
         except Exception:
             return False
 
-    def _strike_ok(strike: float) -> bool:
+    def _pct_otm(strike: float) -> float:
         if direction == "call":
-            return current_price * 0.97 <= strike <= current_price * 1.18
-        else:
-            return current_price * 0.82 <= strike <= current_price * 1.03
+            return (strike - current_price) / current_price * 100
+        return (current_price - strike) / current_price * 100
 
-    # Filter to real-priced, DTE-valid, appropriately-struck contracts
+    def _contract_info(c: dict) -> dict:
+        strike   = float(c.get("strike", 0) or 0)
+        exp      = str(c.get("expiration", ""))
+        mid      = _mid(c)
+        cost     = round(mid * 100, 2)
+        vol      = int(c.get("volume") or c.get("vol") or 0)
+        oi       = int(c.get("openInterest") or c.get("oi") or 0)
+        iv       = c.get("impliedVolatility")
+        iv_pct   = f"{round(float(iv)*100, 1)}%" if iv else "n/a"
+        dte_days = (date.fromisoformat(exp) - today).days if exp else 0
+        otm_pct  = round(_pct_otm(strike), 1)
+        return {
+            "strike": strike, "expiration": exp, "direction": direction,
+            "mid_price": mid, "cost_per_contract": cost,
+            "volume": vol, "open_interest": oi, "iv_pct": iv_pct,
+            "dte_days": dte_days, "pct_otm": otm_pct,
+            "label": f"${strike:.0f}{direction[0].upper()} {exp} ({dte_days}DTE, {otm_pct:+.1f}%OTM) "
+                     f"mid=${mid} · 1 contract=${cost} · IV={iv_pct} · vol={vol:,}",
+        }
+
+    # Pull candidates: valid price, DTE in window, strike within 35% of current price
     candidates = [
-        c for c in contracts
+        c for c in raw_contracts
         if _within_dte(str(c.get("expiration", "")))
-        and _strike_ok(float(c.get("strike", 0) or 0))
         and _mid(c) > 0.05
+        and abs(_pct_otm(float(c.get("strike", 0) or 0))) <= 35
     ]
 
-    # If no valid candidates from stored chain, fetch live from yfinance
+    # Fallback to live yfinance fetch when stored chain has stale/no prices
     if not candidates:
         candidates = _fetch_live_contracts(symbol, direction, current_price,
                                            dte_min, dte_max)
 
     if not candidates:
         return {
-            "expiration": None, "strike": None, "direction": direction,
-            "mid_price": None, "cost_per_contract": None,
-            "volume": None, "open_interest": None, "iv": None,
-            "within_budget": False,
+            "tiers": None,
             "notes": (
                 f"No liquid options found for {symbol} within {dte_min}–{dte_max} DTE. "
-                "Market may be closed or data unavailable pre-market."
+                "Market may be closed or data not yet settled (try after 9:45 AM ET)."
             ),
         }
 
-    # Score: best near-ATM liquid contract — budget is informational only, never filters
-    def _score(c: dict) -> tuple:
-        strike = float(c.get("strike", 0) or 0)
-        dist_from_atm = abs(strike - current_price) / current_price
-        vol = int(c.get("volume") or c.get("vol") or 0)
-        return (dist_from_atm, -vol)
+    def _best_in_band(lo_pct: float, hi_pct: float) -> Optional[dict]:
+        """Best (most liquid) contract with OTM% in [lo_pct, hi_pct]."""
+        band = [
+            c for c in candidates
+            if lo_pct <= _pct_otm(float(c.get("strike", 0) or 0)) <= hi_pct
+        ]
+        if not band:
+            return None
+        return _contract_info(max(band, key=lambda c: int(c.get("volume") or c.get("vol") or 0)))
 
-    best = sorted(candidates, key=_score)[0]
-    mid   = _mid(best)
-    cost  = round(mid * 100, 2)
-    strike = float(best.get("strike", 0) or 0)
-    exp    = str(best.get("expiration", ""))
-    vol    = int(best.get("volume") or best.get("vol") or 0)
-    oi     = int(best.get("openInterest") or best.get("oi") or 0)
-    iv     = best.get("impliedVolatility")
-    iv_pct = f"{round(float(iv)*100, 1)}%" if iv else "n/a"
-    dte_days = (date.fromisoformat(exp) - today).days if exp else 0
-    pct_otm = round((strike - current_price) / current_price * 100, 1) if direction == "call" \
-              else round((current_price - strike) / current_price * 100, 1)
+    def _most_affordable() -> Optional[dict]:
+        """Most affordable contract within a reasonable OTM band (≤30% OTM).
+        Prefers contracts within budget; if none fit, returns cheapest in band."""
+        reasonable = [
+            c for c in candidates
+            if 0 <= _pct_otm(float(c.get("strike", 0) or 0)) <= 30
+        ]
+        if not reasonable:
+            reasonable = candidates
 
-    notes = (
-        f"${strike:.0f}{direction[0].upper()} exp {exp} ({dte_days}DTE, {pct_otm:+.1f}% OTM)  "
-        f"IV={iv_pct}  vol={vol:,}  OI={oi:,}"
-    )
+        within_budget = [c for c in reasonable if _mid(c) * 100 <= budget]
+        pool = within_budget if within_budget else reasonable
+        return _contract_info(min(pool, key=lambda c: _mid(c) * 100))
+
+    # Build the three tiers
+    if direction == "call":
+        atm_tier        = _best_in_band(-3,   3)   # ATM ±3%
+        slight_otm_tier = _best_in_band( 5,  12)   # 5–12% OTM
+    else:
+        atm_tier        = _best_in_band(-3,   3)   # ATM ±3%
+        slight_otm_tier = _best_in_band( 5,  12)   # 5–12% OTM
+
+    affordable_tier = _most_affordable()
+
+    # Deduplicate: if affordable is same strike as a tier already shown, skip it
+    shown_strikes = {t["strike"] for t in [atm_tier, slight_otm_tier] if t}
+    if affordable_tier and affordable_tier["strike"] in shown_strikes:
+        affordable_tier = None
+
+    tiers = {
+        "atm":         atm_tier,
+        "slight_otm":  slight_otm_tier,
+        "affordable":  affordable_tier,
+    }
+
+    notes_parts = []
+    tier_labels = [
+        ("ATM (high delta, most expensive)", atm_tier),
+        ("Slight OTM (balanced leverage)", slight_otm_tier),
+        ("Affordable (fits budget, high leverage)", affordable_tier),
+    ]
+    for label, tier in tier_labels:
+        if tier:
+            notes_parts.append(f"[{label}]  {tier['label']}")
 
     return {
-        "expiration":        exp,
-        "strike":            strike,
-        "direction":         direction,
-        "mid_price":         mid,
-        "cost_per_contract": cost,
-        "volume":            vol,
-        "open_interest":     oi,
-        "iv_pct":            iv_pct,
-        "notes":             notes,
+        "tiers": tiers,
+        "direction": direction,
+        "notes": "\n".join(notes_parts) if notes_parts else "No liquid contracts found.",
     }
 
 
@@ -964,10 +1008,17 @@ def print_results(
             if a.get("target_note"):
                 print(f"     Target   : {a['target_note']}")
             rc = a.get("recommended_contract")
-            if rc and rc.get("strike"):
-                cost = rc.get("cost_per_contract")
-                print(f"     Contract : {rc.get('notes','').splitlines()[0]}  "
-                      f"${cost:.0f}/contract")
+            if rc and rc.get("tiers"):
+                print(f"     Contracts:")
+                tier_names = [
+                    ("ATM        ", "atm"),
+                    ("Slight OTM ", "slight_otm"),
+                    ("Affordable ", "affordable"),
+                ]
+                for label, key in tier_names:
+                    t = rc["tiers"].get(key)
+                    if t:
+                        print(f"       {label}: {t['label']}")
 
     # Summary of non-alert candidates
     below   = [s for s in all_scored if s["direction"] != "skip" and s not in alerts]
