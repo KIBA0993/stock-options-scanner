@@ -1,4 +1,9 @@
 {
+  "budget": {
+    "total_usd": 500,
+    "weekly_trade_max": 2,
+    "per_trade_usd": 250
+  },
   "llm": {
     "provider": "mammouth",
     "model": "claude-sonnet-4-6",

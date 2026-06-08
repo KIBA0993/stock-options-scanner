@@ -699,6 +699,201 @@ def score_candidates(
 
 
 # ─── Filtering & Ranking ───────────────────────────────────────────────────────
+def _parse_dte_range(dte_hint: Optional[str]) -> tuple[int, int]:
+    """Parse '14-30 days' → (14, 30). Fallback: (7, 45)."""
+    if not dte_hint:
+        return 7, 45
+    nums = re.findall(r"\d+", dte_hint)
+    if len(nums) >= 2:
+        return int(nums[0]), int(nums[1])
+    if len(nums) == 1:
+        n = int(nums[0])
+        return max(1, n - 7), n + 7
+    return 7, 45
+
+
+def pick_option_contract(
+    symbol:        str,
+    direction:     str,
+    current_price: float,
+    options_chain: dict,
+    dte_hint:      Optional[str],
+    budget:        float,
+    all_data:      Optional[dict] = None,
+) -> dict:
+    """
+    Select the best option contract for this alert within budget.
+
+    Returns a dict with: expiration, strike, direction, mid_price,
+    cost_per_contract, volume, open_interest, iv, within_budget, notes.
+    Falls back to a live yfinance fetch if the stored chain has no real prices.
+    """
+    dte_min, dte_max = _parse_dte_range(dte_hint)
+    today = date.today()
+    contracts = options_chain.get("calls" if direction == "call" else "puts", [])
+
+    def _mid(c: dict) -> float:
+        bid  = float(c.get("bid")  or 0)
+        ask  = float(c.get("ask")  or 0)
+        last = float(c.get("lastPrice") or c.get("last") or 0)
+        if bid > 0.01 and ask > 0.01:
+            return round((bid + ask) / 2, 2)
+        if last > 0.05:
+            return last
+        return 0.0
+
+    def _within_dte(exp: str) -> bool:
+        try:
+            d = (date.fromisoformat(exp) - today).days
+            return dte_min <= d <= dte_max
+        except Exception:
+            return False
+
+    def _strike_ok(strike: float) -> bool:
+        if direction == "call":
+            return current_price * 0.97 <= strike <= current_price * 1.18
+        else:
+            return current_price * 0.82 <= strike <= current_price * 1.03
+
+    # Filter to real-priced, DTE-valid, appropriately-struck contracts
+    candidates = [
+        c for c in contracts
+        if _within_dte(str(c.get("expiration", "")))
+        and _strike_ok(float(c.get("strike", 0) or 0))
+        and _mid(c) > 0.05
+    ]
+
+    # If no valid candidates from stored chain, fetch live from yfinance
+    if not candidates:
+        candidates = _fetch_live_contracts(symbol, direction, current_price,
+                                           dte_min, dte_max)
+
+    if not candidates:
+        return {
+            "expiration": None, "strike": None, "direction": direction,
+            "mid_price": None, "cost_per_contract": None,
+            "volume": None, "open_interest": None, "iv": None,
+            "within_budget": False,
+            "notes": (
+                f"No liquid options found for {symbol} within {dte_min}–{dte_max} DTE. "
+                "Market may be closed or data unavailable pre-market."
+            ),
+        }
+
+    # Score: prefer within budget, closest to ATM, highest volume
+    def _score(c: dict) -> tuple:
+        cost = _mid(c) * 100
+        strike = float(c.get("strike", 0) or 0)
+        dist_from_atm = abs(strike - current_price) / current_price
+        in_budget = cost <= budget
+        vol = int(c.get("volume") or c.get("vol") or 0)
+        return (not in_budget, dist_from_atm, -vol)
+
+    best = sorted(candidates, key=_score)[0]
+    mid   = _mid(best)
+    cost  = round(mid * 100, 2)
+    strike = float(best.get("strike", 0) or 0)
+    exp    = str(best.get("expiration", ""))
+    vol    = int(best.get("volume") or best.get("vol") or 0)
+    oi     = int(best.get("openInterest") or best.get("oi") or 0)
+    iv     = best.get("impliedVolatility")
+    iv_pct = f"{round(float(iv)*100, 1)}%" if iv else "n/a"
+    dte_days = (date.fromisoformat(exp) - today).days if exp else 0
+    pct_otm = round((strike - current_price) / current_price * 100, 1) if direction == "call" \
+              else round((current_price - strike) / current_price * 100, 1)
+
+    within_budget = cost <= budget
+    notes = (
+        f"${strike:.0f}{direction[0].upper()} exp {exp} ({dte_days}DTE, {pct_otm:+.1f}% OTM)  "
+        f"IV={iv_pct}  vol={vol:,}  OI={oi:,}"
+    )
+    if not within_budget:
+        cheapest_in_budget = next(
+            (c for c in sorted(candidates, key=lambda c: _mid(c) * 100)
+             if _mid(c) * 100 <= budget), None
+        )
+        if cheapest_in_budget:
+            cb_mid  = _mid(cheapest_in_budget)
+            cb_cost = round(cb_mid * 100, 2)
+            notes += (
+                f"\n⚠ Cheapest within ${budget:.0f}: "
+                f"${cheapest_in_budget['strike']}{direction[0].upper()} "
+                f"@ ${cb_mid} (${cb_cost}/contract) — very deep OTM, high risk"
+            )
+        else:
+            notes += (
+                f"\n⚠ Budget gap: cheapest option = ${cost:.0f}/contract. "
+                f"Consider raising per-trade budget to ${round(cost * 1.1 / 50) * 50:.0f}."
+            )
+
+    return {
+        "expiration":        exp,
+        "strike":            strike,
+        "direction":         direction,
+        "mid_price":         mid,
+        "cost_per_contract": cost,
+        "volume":            vol,
+        "open_interest":     oi,
+        "iv_pct":            iv_pct,
+        "within_budget":     within_budget,
+        "notes":             notes,
+    }
+
+
+def _fetch_live_contracts(
+    symbol:     str,
+    direction:  str,
+    price:      float,
+    dte_min:    int,
+    dte_max:    int,
+) -> list[dict]:
+    """Fetch live options chain from yfinance when stored chain has stale/empty prices."""
+    try:
+        import math
+        import yfinance as yf
+        t    = yf.Ticker(symbol)
+        exps = t.options or []
+        today = date.today()
+        target_exps = [
+            e for e in exps
+            if dte_min <= (date.fromisoformat(e) - today).days <= dte_max
+        ]
+        if not target_exps:
+            target_exps = [exps[0]] if exps else []
+
+        result = []
+        for exp in target_exps[:2]:
+            chain = t.option_chain(exp)
+            df = chain.calls if direction == "call" else chain.puts
+            # Accept bid>0 OR lastPrice>0 (options settle ~15 min after market open)
+            df = df[(df["bid"] > 0.05) | (df["lastPrice"] > 0.10)].copy()
+            for _, row in df.iterrows():
+                def _safe_int(v):
+                    try:
+                        return 0 if (v is None or (isinstance(v, float) and math.isnan(v))) else int(v)
+                    except Exception:
+                        return 0
+                def _safe_float(v):
+                    try:
+                        return None if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
+                    except Exception:
+                        return None
+                result.append({
+                    "strike":            float(row["strike"]),
+                    "expiration":        exp,
+                    "bid":               float(row.get("bid") or 0),
+                    "ask":               float(row.get("ask") or 0),
+                    "lastPrice":         float(row.get("lastPrice") or 0),
+                    "volume":            _safe_int(row.get("volume")),
+                    "openInterest":      _safe_int(row.get("openInterest")),
+                    "impliedVolatility": _safe_float(row.get("impliedVolatility")),
+                })
+        return result
+    except Exception as exc:
+        logger.warning(f"Live options fetch failed for {symbol}: {exc}")
+        return []
+
+
 def filter_alerts(
     scored:     list[dict],
     min_score:  float,
@@ -784,6 +979,14 @@ def print_results(
                 print(f"     Stop     : {a['stop_note']}")
             if a.get("target_note"):
                 print(f"     Target   : {a['target_note']}")
+            rc = a.get("recommended_contract")
+            if rc:
+                cost = rc.get("cost_per_contract")
+                flag = "✓" if rc.get("within_budget") else "⚠ over budget"
+                print(f"     Contract : {rc.get('notes','').splitlines()[0]}  "
+                      f"${cost:.0f}/contract  [{flag}]")
+                for extra in rc.get("notes", "").splitlines()[1:]:
+                    print(f"               {extra}")
 
     # Summary of non-alert candidates
     below   = [s for s in all_scored if s["direction"] != "skip" and s not in alerts]
@@ -877,6 +1080,36 @@ def main() -> None:
             s["would_have_direction"] = s.get("direction")
 
     alerts = filter_alerts(all_scored, min_score, max_alerts, config=config)
+
+    # ── Pick specific option contracts for each alert ─────────────────────────
+    per_trade_budget = config.get("budget", {}).get("per_trade_usd", 250)
+    # Build a lookup: symbol → options_chain from the raw scan data
+    chain_by_sym = {
+        t["symbol"]: t.get("options_chain", {})
+        for t in tickers
+    }
+    for alert in alerts:
+        sym     = alert["symbol"]
+        try:
+            contract = pick_option_contract(
+                symbol        = sym,
+                direction     = alert["direction"],
+                current_price = next((t["price"] for t in tickers if t["symbol"] == sym), 0),
+                options_chain = chain_by_sym.get(sym, {}),
+                dte_hint      = alert.get("suggested_dte"),
+                budget        = per_trade_budget,
+            )
+            alert["recommended_contract"] = contract
+            if contract.get("cost_per_contract"):
+                cost = contract["cost_per_contract"]
+                flag = "✓ within budget" if contract["within_budget"] else f"⚠ over ${per_trade_budget:.0f} budget"
+                logger.info(
+                    f"Contract for {sym}: {contract.get('notes','').splitlines()[0]}  "
+                    f"${cost:.0f}/contract  {flag}"
+                )
+        except Exception as exc:
+            logger.warning(f"Contract picker failed for {sym}: {exc}")
+            alert["recommended_contract"] = None
 
     # ── Archive full scored output for reflect.py ─────────────────────────────
     if not args.dry_run:

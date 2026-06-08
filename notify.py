@@ -304,6 +304,48 @@ def _alert_card_html(a: dict) -> str:
         {signals}
       </ul>
       {trade_plan}
+      {_contract_html(a)}
+    </div>
+    """
+
+
+def _contract_html(a: dict) -> str:
+    """Render the recommended option contract block."""
+    rc = a.get("recommended_contract")
+    if not rc or not rc.get("strike"):
+        return ""
+
+    within   = rc.get("within_budget", False)
+    cost     = rc.get("cost_per_contract")
+    bg_color = "#dafbe1" if within else "#fff8c5"
+    bdr_color = "#2da44e" if within else "#d29922"
+    badge    = ("✓ within budget" if within
+                else f"⚠ over budget — actual cost ${cost:.0f}")
+    dir_str  = rc.get("direction", "").upper()
+    extra_lines = rc.get("notes", "").splitlines()[1:]
+    extras = "".join(
+        f'<p style="margin:4px 0; font-size:12px; color:#cf222e;">{l}</p>'
+        for l in extra_lines
+    )
+
+    return f"""
+    <div style="background:{bg_color}; border:1px solid {bdr_color}; border-radius:8px;
+                padding:12px 16px; margin-top:10px; font-family:system-ui,sans-serif;">
+      <div style="font-size:11px; font-weight:700; text-transform:uppercase;
+                  letter-spacing:.5px; color:{bdr_color}; margin-bottom:6px;">
+        💎 Recommended Option Contract
+      </div>
+      <div style="font-size:18px; font-weight:700; color:#24292f;">
+        {a['symbol']} ${rc['strike']:.0f} {dir_str} · {rc['expiration']}
+      </div>
+      <div style="margin:6px 0; font-size:13px; color:#57606a;">
+        Mid: <b>${rc['mid_price']}</b>/share
+        &nbsp;│&nbsp; <b>1 contract = ${cost:.0f}</b>
+        &nbsp;│&nbsp; IV: {rc.get('iv_pct','n/a')}
+        &nbsp;│&nbsp; Vol: {rc['volume']:,} &nbsp;│&nbsp; OI: {rc['open_interest']:,}
+      </div>
+      <div style="font-size:12px; font-weight:600; color:{bdr_color};">{badge}</div>
+      {extras}
     </div>
     """
 
@@ -431,6 +473,17 @@ def format_email_text(
             lines.append(f"Stop:   {a['stop_note']}")
         if a.get("target_note"):
             lines.append(f"Target: {a['target_note']}")
+        rc = a.get("recommended_contract")
+        if rc and rc.get("strike"):
+            lines.append(f"--- Recommended Contract ---")
+            lines.append(
+                f"{a['symbol']} ${rc['strike']:.0f}{rc['direction'][0].upper()} "
+                f"exp {rc['expiration']} | mid=${rc['mid_price']} | "
+                f"1 contract=${rc['cost_per_contract']:.0f} "
+                f"({'✓ within budget' if rc['within_budget'] else '⚠ over budget'})"
+            )
+            for extra in rc.get("notes", "").splitlines()[1:]:
+                lines.append(f"  {extra}")
     return "\n".join(lines)
 
 
