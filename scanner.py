@@ -361,12 +361,179 @@ def get_news(symbols: list[str]) -> dict[str, list]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def get_specific_tickers(symbols: list[str]) -> tuple[list[dict], bool]:
+    """
+    Fetch TA data for a specific list of symbols via tradingview-screener,
+    bypassing the volume filter. Used with --symbols flag.
+    """
+    from tradingview_screener import Query, Column
+    try:
+        _count, df = (
+            Query()
+            .set_markets("america")
+            .select(
+                "name", "close", "volume", "average_volume_10d_calc",
+                "relative_volume_10d_calc", "change",
+                "RSI", "MACD.macd", "MACD.signal",
+                "EMA20", "EMA50", "EMA200", "Recommend.All",
+            )
+            .where(Column("name").isin(symbols) | Column("ticker").isin(
+                [f"NASDAQ:{s}" for s in symbols] +
+                [f"NYSE:{s}" for s in symbols] +
+                [f"AMEX:{s}" for s in symbols]
+            ))
+            .limit(len(symbols) * 3)
+            .get_scanner_data()
+        )
+    except Exception:
+        # Fallback: fetch each symbol individually via yfinance TA approximation
+        return _get_tickers_via_yfinance(symbols), False
+
+    if df is None or df.empty:
+        return _get_tickers_via_yfinance(symbols), False
+
+    candidates = []
+    found = set()
+    for _, row in df.iterrows():
+        raw_ticker = str(row.get("ticker", ""))
+        sym = raw_ticker.split(":")[-1] if ":" in raw_ticker else raw_ticker
+        if sym.upper() not in [s.upper() for s in symbols]:
+            continue
+        if sym.upper() in found:
+            continue
+        found.add(sym.upper())
+
+        rec = row.get("Recommend.All")
+        if pd.isna(rec) or rec is None:
+            rec = None
+        else:
+            rec = round(float(rec), 3)
+
+        def _safe(val, digits=2):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return None
+            return round(float(val), digits)
+
+        candidates.append({
+            "symbol": sym.upper(), "tv_ticker": raw_ticker,
+            "name": str(row.get("name", sym)),
+            "price": _safe(row.get("close")),
+            "change_pct": _safe(row.get("change")),
+            "volume": int(row.get("volume", 0)),
+            "avg_volume_10d": _safe(row.get("average_volume_10d_calc"), 0),
+            "relative_volume": _safe(row.get("relative_volume_10d_calc")),
+            "rsi": _safe(row.get("RSI")),
+            "macd": _safe(row.get("MACD.macd")),
+            "macd_signal": _safe(row.get("MACD.signal")),
+            "ema20": _safe(row.get("EMA20")),
+            "ema50": _safe(row.get("EMA50")),
+            "ema200": _safe(row.get("EMA200")),
+            "tv_recommendation": rec,
+        })
+
+    # For any symbol not found in screener, fall back to yfinance
+    missing = [s for s in symbols if s.upper() not in found]
+    if missing:
+        candidates += _get_tickers_via_yfinance(missing)
+
+    return candidates, False
+
+
+def _calc_rsi(closes: list[float], period: int = 14) -> Optional[float]:
+    """Calculate RSI from a list of closing prices."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0) for d in deltas[-period:]]
+    losses = [abs(min(d, 0)) for d in deltas[-period:]]
+    avg_g  = sum(gains)  / period
+    avg_l  = sum(losses) / period
+    if avg_l == 0:
+        return 100.0
+    rs = avg_g / avg_l
+    return round(100 - 100 / (1 + rs), 2)
+
+
+def _calc_ema(closes: list[float], period: int) -> Optional[float]:
+    """Calculate EMA from a list of closing prices."""
+    if len(closes) < period:
+        return None
+    k   = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 4)
+
+
+def _calc_macd(closes: list[float]) -> tuple[Optional[float], Optional[float]]:
+    """Return (MACD line, signal line) using 12/26/9 settings."""
+    ema12 = _calc_ema(closes, 12)
+    ema26 = _calc_ema(closes, 26)
+    if ema12 is None or ema26 is None:
+        return None, None
+    # Build a MACD series for signal calculation
+    macd_series = []
+    k12, k26 = 2/13, 2/27
+    e12 = sum(closes[:12]) / 12
+    e26 = sum(closes[:26]) / 26
+    for price in closes[26:]:
+        e12 = price * k12 + e12 * (1 - k12)
+        e26 = price * k26 + e26 * (1 - k26)
+        macd_series.append(e12 - e26)
+    if len(macd_series) < 9:
+        return round(ema12 - ema26, 4), None
+    signal = sum(macd_series[-9:]) / 9
+    k9 = 2/10
+    for m in macd_series[-9:]:
+        signal = m * k9 + signal * (1 - k9)
+    return round(macd_series[-1], 4), round(signal, 4)
+
+
+def _get_tickers_via_yfinance(symbols: list[str]) -> list[dict]:
+    """Fallback: fetch TA fields via yfinance with manual RSI/EMA/MACD calculation."""
+    results = []
+    for sym in symbols:
+        try:
+            t    = yf.Ticker(sym)
+            hist = t.history(period="300d", interval="1d", auto_adjust=True)
+            if hist is None or hist.empty:
+                continue
+            closes = hist["Close"].dropna().tolist()
+            vols   = hist["Volume"].dropna().tolist()
+
+            price     = round(closes[-1], 2)  if closes            else None
+            chg_1d    = round((closes[-1]-closes[-2])/closes[-2]*100, 2) if len(closes)>=2 else None
+            avg_vol   = round(sum(vols[-10:])/len(vols[-10:]), 0)        if len(vols)>=10  else None
+            today_vol = int(vols[-1])                                    if vols            else 0
+            rel_vol   = round(today_vol / avg_vol, 2) if avg_vol and avg_vol > 0 else None
+
+            rsi    = _calc_rsi(closes)
+            ema20  = _calc_ema(closes, 20)
+            ema50  = _calc_ema(closes, 50)
+            ema200 = _calc_ema(closes, 200)
+            macd, macd_sig = _calc_macd(closes)
+
+            results.append({
+                "symbol": sym.upper(), "tv_ticker": f"yf:{sym.upper()}",
+                "name": sym.upper(), "price": price, "change_pct": chg_1d,
+                "volume": today_vol, "avg_volume_10d": avg_vol, "relative_volume": rel_vol,
+                "rsi": rsi, "macd": macd, "macd_signal": macd_sig,
+                "ema20": ema20, "ema50": ema50, "ema200": ema200,
+                "tv_recommendation": None,
+            })
+        except Exception as exc:
+            logger.warning(f"yfinance fallback failed for {sym}: {exc}")
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="US Market Scanner")
     parser.add_argument("--context", type=str, default=None,
                         help="Free-text context bias passed to LLM (e.g. 'bearish macro today')")
     parser.add_argument("--top-n", type=int, default=None,
                         help="Override pre-filter top N (default: from config.json)")
+    parser.add_argument("--symbols", nargs="+", metavar="TICKER",
+                        help="Force-analyze specific tickers (bypasses volume filter)")
     args = parser.parse_args()
 
     logger.info("=== Scanner started ===")
@@ -375,8 +542,13 @@ def main() -> None:
     if args.top_n:
         config.setdefault("scan", {})["pre_filter_top_n"] = args.top_n
 
-    # Step 1: Volume scan + TA via tradingview-screener
-    candidates, had_errors = get_volume_leaders(config)
+    # Step 1: Volume scan OR specific symbols
+    if args.symbols:
+        syms_upper = [s.upper() for s in args.symbols]
+        logger.info(f"Specific-symbol mode: {syms_upper}")
+        candidates, had_errors = get_specific_tickers(syms_upper)
+    else:
+        candidates, had_errors = get_volume_leaders(config)
 
     if not candidates:
         logger.info("No candidates today.")
@@ -402,19 +574,20 @@ def main() -> None:
     logger.info(f"Fetching 5-day returns for: {symbols}")
     returns_5d = get_5day_returns(symbols)
 
-    # Step 6: Drop tickers with no listed options (safety net for edge cases)
-    no_options = [s for s in symbols if not options.get(s, {}).get("calls") and
-                  not options.get(s, {}).get("puts")]
-    if no_options:
-        logger.info(f"Dropped {len(no_options)} ticker(s) with no listed options: {no_options}")
-        candidates = [c for c in candidates if c["symbol"] not in no_options]
-        symbols    = [c["symbol"] for c in candidates]
+    # Step 6: Drop tickers with no listed options (skip in --symbols mode — user asked explicitly)
+    if not args.symbols:
+        no_options = [s for s in symbols if not options.get(s, {}).get("calls") and
+                      not options.get(s, {}).get("puts")]
+        if no_options:
+            logger.info(f"Dropped {len(no_options)} ticker(s) with no listed options: {no_options}")
+            candidates = [c for c in candidates if c["symbol"] not in no_options]
+            symbols    = [c["symbol"] for c in candidates]
 
-    if not candidates:
-        logger.info("No optionable candidates after filtering.")
-        _write_output([], args.context, had_errors=had_errors)
-        print("\nNo optionable candidates today — all high-volume stocks were OTC or lack options.")
-        return
+        if not candidates:
+            logger.info("No optionable candidates after filtering.")
+            _write_output([], args.context, had_errors=had_errors)
+            print("\nNo optionable candidates today — all high-volume stocks were OTC or lack options.")
+            return
 
     # Step 7: Assemble all_data.json records
     ticker_records = []
