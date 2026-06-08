@@ -246,8 +246,40 @@ def _alert_card_html(a: dict) -> str:
     rationale = a.get("rationale", "")
     method    = "LLM" if a.get("scoring_method") == "llm" else "Heuristic"
     size_hint = a.get("position_size_hint", "")
+
+    entry_note  = a.get("entry_note", "")
+    stop_note   = a.get("stop_note", "")
+    target_note = a.get("target_note", "")
+
     size_line = (f'<div style="margin:6px 0; font-size:13px; color:#1a7f37; font-weight:600;">'
-                 f'💰 Suggested size: {size_hint}</div>') if size_hint else ""
+                 f'💰 Position size: {size_hint}</div>') if size_hint else ""
+
+    trade_plan = ""
+    if entry_note or stop_note or target_note:
+        rows = ""
+        if entry_note:
+            rows += f"""
+            <tr>
+              <td style="padding:5px 8px; font-weight:600; color:#57606a; white-space:nowrap; vertical-align:top;">🎯 Entry</td>
+              <td style="padding:5px 8px; color:#24292f;">{entry_note}</td>
+            </tr>"""
+        if stop_note:
+            rows += f"""
+            <tr style="background:#fff5f5;">
+              <td style="padding:5px 8px; font-weight:600; color:#cf222e; white-space:nowrap; vertical-align:top;">🛑 Stop</td>
+              <td style="padding:5px 8px; color:#24292f;">{stop_note}</td>
+            </tr>"""
+        if target_note:
+            rows += f"""
+            <tr>
+              <td style="padding:5px 8px; font-weight:600; color:#1a7f37; white-space:nowrap; vertical-align:top;">✅ Target</td>
+              <td style="padding:5px 8px; color:#24292f;">{target_note}</td>
+            </tr>"""
+        trade_plan = f"""
+        <div style="margin:12px 0 4px 0; font-size:13px; font-weight:600; color:#57606a; text-transform:uppercase; letter-spacing:.5px;">Trade Plan</div>
+        <table style="width:100%; border-collapse:collapse; border:1px solid #d0d7de; border-radius:6px; overflow:hidden; font-size:13px;">
+          {rows}
+        </table>"""
 
     return f"""
     <div style="border:1px solid #d0d7de; border-radius:8px; padding:16px;
@@ -267,10 +299,11 @@ def _alert_card_html(a: dict) -> str:
         Frameworks: {creators}
       </div>
       {size_line}
-      <p style="font-size:14px; color:#24292f; margin:8px 0;">{rationale}</p>
-      <ul style="font-size:13px; color:#57606a; margin:4px 0; padding-left:20px;">
+      <p style="font-size:14px; color:#24292f; margin:10px 0 6px 0;">{rationale}</p>
+      <ul style="font-size:13px; color:#57606a; margin:4px 0 8px 0; padding-left:20px;">
         {signals}
       </ul>
+      {trade_plan}
     </div>
     """
 
@@ -385,13 +418,19 @@ def format_email_text(
             f"Score: {int(a['score']*100)}%  Risk: {a.get('risk_level')}  DTE: {a.get('suggested_dte')}",
         ]
         if size_hint:
-            lines.append(f"Suggested size: {size_hint}")
+            lines.append(f"Size: {size_hint}")
         lines += [
             f"Rationale: {a.get('rationale')}",
             "Signals:",
         ]
         for s in a.get("key_signals", [])[:5]:
             lines.append(f"  • {s}")
+        if a.get("entry_note"):
+            lines.append(f"Entry:  {a['entry_note']}")
+        if a.get("stop_note"):
+            lines.append(f"Stop:   {a['stop_note']}")
+        if a.get("target_note"):
+            lines.append(f"Target: {a['target_note']}")
     return "\n".join(lines)
 
 

@@ -281,6 +281,9 @@ Evaluate each candidate. Return ONLY this exact JSON:
       "key_signals": ["RSI 81 overbought", "bearish EMA stack", "heavy put flow 0.4x"],
       "suggested_dte": "7-14 days",
       "risk_level": "medium",
+      "entry_note": "Enter near $X on a close above/below [level]; ideal entry window [time/condition]",
+      "stop_note": "Stop if price closes above/below $X (option stops at 40-50% of premium)",
+      "target_note": "First target $X (~1.5R); full exit at $Y (~2.5R) or if [condition]",
       "skip_reason": null
     }}
   ]
@@ -296,13 +299,15 @@ RULES:
 1. direction must be "call", "put", or "skip" (exact string)
 2. risk_level must be "low", "medium", or "high" (exact string)
 3. suggested_dte examples: "0-2 days", "7-14 days", "14-30 days", "30+ days"
-4. If direction = "skip" → set score ≤ 0.39 and fill skip_reason
+4. If direction = "skip" → set score ≤ 0.39, fill skip_reason, entry/stop/target may be null
 5. Check Red Flags for each creator — any match reduces score to ≤ 0.4
 6. kpak82 trades REVERSALS at extremes, NOT momentum chasing
 7. MasterPandaWu requires macro turning windows — only apply to broad market setups
 8. puppy_trades: use only for sector rotation themes (solar/nuclear/biotech/AI/space)
 9. CryptoKaleo: only generic TA principles (bull flag, HTF support) — never crypto signals
 10. Earnings in 48h → penalise score heavily unless setup specifically targets earnings gap
+11. entry_note/stop_note/target_note: reference the STOCK price (not option premium) for levels.
+    Option premium stop = 40-50% loss of premium paid. Be specific about price levels when possible.
 """
 
 
@@ -773,6 +778,12 @@ def print_results(
             signals = a.get("key_signals", [])[:4]
             if signals:
                 print(f"     Signals  : {' | '.join(signals)}")
+            if a.get("entry_note"):
+                print(f"     Entry    : {a['entry_note']}")
+            if a.get("stop_note"):
+                print(f"     Stop     : {a['stop_note']}")
+            if a.get("target_note"):
+                print(f"     Target   : {a['target_note']}")
 
     # Summary of non-alert candidates
     below   = [s for s in all_scored if s["direction"] != "skip" and s not in alerts]
