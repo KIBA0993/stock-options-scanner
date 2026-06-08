@@ -92,7 +92,13 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
     min_vol       = scan.get("min_total_volume", 2_000_000)
     top_n         = scan.get("pre_filter_top_n", 10)
 
-    logger.info(f"Scanning US stocks (rel_vol>{min_rel_vol}x, price>${min_price}, vol>{min_vol:,})...")
+    # Only listed exchanges that have options markets — excludes OTC/pink sheets
+    LISTED_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSE ARCA", "NYSE MKT"}
+
+    logger.info(
+        f"Scanning US stocks (rel_vol>{min_rel_vol}x, price>${min_price}, "
+        f"vol>{min_vol:,}, exchanges={sorted(LISTED_EXCHANGES)})..."
+    )
     try:
         count, df = (
             Query()
@@ -118,7 +124,7 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
                 Column("relative_volume_10d_calc") > min_rel_vol,
             )
             .order_by("relative_volume_10d_calc", ascending=False)
-            .limit(top_n)
+            .limit(top_n * 3)   # fetch extra to absorb OTC drop-offs
             .get_scanner_data()
         )
     except Exception as exc:
@@ -131,9 +137,20 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
 
     # ticker column is formatted as 'EXCHANGE:SYMBOL', e.g. 'NASDAQ:AAPL'
     candidates = []
+    otc_dropped = 0
     for _, row in df.iterrows():
         raw_ticker = str(row.get("ticker", ""))
-        symbol = raw_ticker.split(":")[-1] if ":" in raw_ticker else raw_ticker
+        exchange   = raw_ticker.split(":")[0].upper() if ":" in raw_ticker else ""
+        symbol     = raw_ticker.split(":")[-1] if ":" in raw_ticker else raw_ticker
+
+        # Drop OTC / pink-sheet / foreign listings — no listed options
+        if exchange and exchange not in LISTED_EXCHANGES:
+            otc_dropped += 1
+            logger.debug(f"Dropped OTC/unlisted: {raw_ticker}")
+            continue
+
+        if len(candidates) >= top_n:
+            break   # have enough after filtering
 
         # TradingView recommendation: float in [-1, 1]; positive = buy bias
         rec = row.get("Recommend.All")
@@ -166,7 +183,9 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
             "tv_recommendation": rec,
         })
 
-    logger.info(f"Screener returned {len(candidates)} candidates ({count} total matches in market).")
+    if otc_dropped:
+        logger.info(f"Dropped {otc_dropped} OTC/unlisted ticker(s) — no listed options.")
+    logger.info(f"Screener returned {len(candidates)} listed candidates ({count} total matches in market).")
     return candidates, False
 
 
@@ -383,7 +402,21 @@ def main() -> None:
     logger.info(f"Fetching 5-day returns for: {symbols}")
     returns_5d = get_5day_returns(symbols)
 
-    # Step 6: Assemble all_data.json records
+    # Step 6: Drop tickers with no listed options (safety net for edge cases)
+    no_options = [s for s in symbols if not options.get(s, {}).get("calls") and
+                  not options.get(s, {}).get("puts")]
+    if no_options:
+        logger.info(f"Dropped {len(no_options)} ticker(s) with no listed options: {no_options}")
+        candidates = [c for c in candidates if c["symbol"] not in no_options]
+        symbols    = [c["symbol"] for c in candidates]
+
+    if not candidates:
+        logger.info("No optionable candidates after filtering.")
+        _write_output([], args.context, had_errors=had_errors)
+        print("\nNo optionable candidates today — all high-volume stocks were OTC or lack options.")
+        return
+
+    # Step 7: Assemble all_data.json records
     ticker_records = []
     for c in candidates:
         sym = c["symbol"]
