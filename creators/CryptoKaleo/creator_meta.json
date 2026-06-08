@@ -1,0 +1,12 @@
+{
+  "handle": "CryptoKaleo",
+  "display_name": "K A L E O",
+  "asset_focus": "CRYPTO — Bitcoin, Ethereum, altcoin options",
+  "style": "technical analysis, crypto options, cycle analysis",
+  "active_since": "2017",
+  "follower_count": "718600",
+  "tradingview": "https://www.tradingview.com/u/cryptokaleo/",
+  "scanner_relevance": "low",
+  "notes": "IMPORTANT: Primarily a crypto options trader, not US equity options. His TA methodology (support/resistance, RSI, chart patterns) is transferable, but his asset-specific setups (BTC dominance, altseason timing) will NOT match our US stock scanner. Use his framework only for TA pattern recognition and risk management style — discard crypto-specific signals.",
+  "framework_versions": ["framework-v1.md"]
+}

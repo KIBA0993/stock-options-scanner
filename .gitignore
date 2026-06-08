@@ -1,0 +1,39 @@
+# ── Sensitive / secrets ─────────────────────────────────────────────────────
+config.json            # contains API keys — copy from config.json.template
+
+# ── Runtime data (regenerated on each run) ───────────────────────────────────
+data/
+logs/
+
+# ── Scraped X posts (regenerated via: python distill.py --refresh) ───────────
+creators/*/posts_raw.txt
+
+# ── Amendment drafts (local to your review workflow) ─────────────────────────
+creators/*/amendments/
+
+# ── Python build artifacts ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── Editor ───────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

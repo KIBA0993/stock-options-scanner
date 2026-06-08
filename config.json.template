@@ -1,0 +1,36 @@
+{
+  "llm": {
+    "provider": "mammouth",
+    "model": "claude-sonnet-4-6",
+    "api_key": "YOUR_MAMMOUTH_OR_ANTHROPIC_API_KEY",
+    "ollama_model": "qwen2.5:14b",
+    "max_tokens": 4096
+  },
+  "notifications": {
+    "telegram": {
+      "enabled": false,
+      "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+      "chat_id": "YOUR_TELEGRAM_CHAT_ID"
+    },
+    "email": {
+      "enabled": false,
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "username": "YOUR_EMAIL",
+      "password": "YOUR_APP_PASSWORD",
+      "to": "YOUR_EMAIL"
+    }
+  },
+  "x_api": {
+    "bearer_token": "YOUR_X_TWITTER_BEARER_TOKEN"
+  },
+  "scan": {
+    "min_relative_volume": 1.5,
+    "min_price": 10.0,
+    "min_total_volume": 1000000,
+    "earnings_buffer_hours": 48,
+    "pre_filter_top_n": 5,
+    "min_score": 0.60,
+    "max_daily_candidates": 2
+  }
+}

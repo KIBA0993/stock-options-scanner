@@ -1,0 +1,11 @@
+{
+  "handle": "puppy_trades",
+  "display_name": "Puppy Trades",
+  "asset_focus": "$SPY $QQQ $TSLA $BTC $XRP $DOGE",
+  "style": "wave theorist, dividend quant",
+  "active_since": "unknown",
+  "follower_count": "25000",
+  "scanner_relevance": "low",
+  "notes": "Elliott Wave analyst covering broad US stock universe (SPY, QQQ, TSLA, NVDA, ENPH, FSLR, IBM, PLTR, HOOD, OKTA, IWM, DDOG, ZM, BABA, MRNA, NVAX, etc.). Actual EW counts are in YouTube video links — only price targets and sector themes are visible in tweet text. Bio says 'PARODY' (legal disclaimer). 90% of posts are spam-replies of the same video link to unrelated accounts. Use for sector rotation confirmation only, at low weight. Bio confirms: 'All Posts are PARODY and not investment advice'.",
+  "framework_versions": ["framework-v1.md"]
+}
