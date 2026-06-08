@@ -431,10 +431,28 @@ def get_specific_tickers(symbols: list[str]) -> tuple[list[dict], bool]:
             "tv_recommendation": rec,
         })
 
-    # For any symbol not found in screener, fall back to yfinance
+    # For any symbol not found in screener, fall back to yfinance entirely
     missing = [s for s in symbols if s.upper() not in found]
     if missing:
         candidates += _get_tickers_via_yfinance(missing)
+
+    # For symbols found but with missing TA (screener returned NaN for RSI/EMA/MACD),
+    # patch those fields from yfinance — screener sometimes fails TA for certain tickers
+    ta_missing = [c["symbol"] for c in candidates if c.get("rsi") is None]
+    if ta_missing:
+        logger.info(f"Patching TA via yfinance for {ta_missing} (screener returned NaN)")
+        yf_data = {d["symbol"]: d for d in _get_tickers_via_yfinance(ta_missing)}
+        for c in candidates:
+            if c["symbol"] in yf_data:
+                yf = yf_data[c["symbol"]]
+                for field in ("rsi", "ema20", "ema50", "ema200", "macd", "macd_signal"):
+                    if c.get(field) is None and yf.get(field) is not None:
+                        c[field] = yf[field]
+                # Also patch price/change_pct if screener returned None
+                if c.get("price") is None and yf.get("price") is not None:
+                    c["price"] = yf["price"]
+                if c.get("change_pct") is None and yf.get("change_pct") is not None:
+                    c["change_pct"] = yf["change_pct"]
 
     return candidates, False
 
