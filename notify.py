@@ -342,8 +342,9 @@ def _contract_html(a: dict) -> str:
           </td>
           <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; font-size:13px; color:#57606a; white-space:nowrap;">
             <b>1 contract = ${t['cost_per_contract']:.0f}</b><br>
-            <span style="font-size:11px;">bid ${t.get('bid','?')} / ask ${t.get('ask','?')} / mid ${t['mid_price']}</span>
-            {'<br><span style="font-size:11px;color:#cf222e;">⚠ wide spread ' + str(int(t.get("spread_pct",0))) + '%</span>' if t.get("spread_pct",0) > 25 else ''}
+            <span style="font-size:11px;">bid ${t.get('bid','?')} / ask ${t.get('ask','?')} / mid ${t['mid_price']}
+              &nbsp;·&nbsp; spread {t.get('spread_pct',0):.0f}%</span>
+            {'<br><span style="font-size:11px;color:#cf222e;">⚠ ' + t["spread_warning"].split("—")[0].strip() + '</span>' if t.get("spread_warning") else ''}
           </td>
           <td style="padding:8px 10px; border-bottom:1px solid #eaeef2; font-size:12px; color:#57606a;">
             {t['pct_otm']:+.1f}% OTM · {t['dte_days']}DTE

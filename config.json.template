@@ -47,6 +47,12 @@
   },
   "options": {
     "preferred_dte": "7-14 days",
-    "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget"
+    "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget",
+    "max_spread_pct": {
+      "atm":         20,
+      "slight_otm":  25,
+      "affordable":  35,
+      "comment": "Max bid/ask spread as % of mid. Wide spreads mean poor fills on a small account."
+    }
   }
 }
