@@ -37,14 +37,15 @@
     "bearer_token": "YOUR_X_TWITTER_BEARER_TOKEN"
   },
   "scan": {
-    "min_relative_volume": 1.5,
     "min_price": 10.0,
-    "min_total_volume": 1000000,
+    "min_total_volume": 500000,
     "earnings_buffer_hours": 48,
-    "pre_filter_top_n": 5,
+    "screener_top_n": 300,
+    "pre_filter_top_n": 20,
     "min_score": 0.60,
     "max_daily_candidates": 2
   },
+  "watchlist": [],
   "options": {
     "preferred_dte": "7-14 days",
     "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget",

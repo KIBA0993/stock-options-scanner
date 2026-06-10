@@ -91,10 +91,9 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
     scan = config.get("scan", {})
     min_price     = scan.get("min_price", 10.0)
     min_vol       = scan.get("min_total_volume", 500_000)   # liquidity floor only
-    top_n         = scan.get("pre_filter_top_n", 10)
-    # min_relative_volume is kept in config for reference/logging but no longer
-    # used as a hard gate — it's passed to the LLM as a signal instead.
-    min_rel_vol_note = scan.get("min_relative_volume", 1.5)
+    # screener_top_n: how many the TradingView screener returns (broad universe)
+    # pre_filter_top_n: how many get expensive per-ticker calls (options/news)
+    screener_top_n = scan.get("screener_top_n", 300)
 
     # Only listed exchanges that have options markets — excludes OTC/pink sheets
     LISTED_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSE ARCA", "NYSE MKT"}
@@ -129,7 +128,7 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
                 # that haven't yet shown a volume spike.
             )
             .order_by("relative_volume_10d_calc", ascending=False)
-            .limit(top_n * 3)   # fetch extra to absorb OTC drop-offs
+            .limit(screener_top_n * 2)   # fetch extra to absorb OTC drop-offs
             .get_scanner_data()
         )
     except Exception as exc:
@@ -154,8 +153,8 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
             logger.debug(f"Dropped OTC/unlisted: {raw_ticker}")
             continue
 
-        if len(candidates) >= top_n:
-            break   # have enough after filtering
+        if len(candidates) >= screener_top_n:
+            break   # have the full broad universe
 
         # TradingView recommendation: float in [-1, 1]; positive = buy bias
         rec = row.get("Recommend.All")
@@ -190,7 +189,10 @@ def get_volume_leaders(config: dict) -> tuple[list[dict], bool]:
 
     if otc_dropped:
         logger.info(f"Dropped {otc_dropped} OTC/unlisted ticker(s) — no listed options.")
-    logger.info(f"Screener returned {len(candidates)} listed candidates ({count} total matches in market).")
+    logger.info(
+        f"Screener returned {len(candidates)} listed candidates "
+        f"({count} total matches in market). Trendline triage will select best for options fetch."
+    )
     return candidates, False
 
 
@@ -592,6 +594,118 @@ def _get_tickers_via_yfinance(symbols: list[str]) -> list[dict]:
     return results
 
 
+def _trendline_prescore(tl: dict, rel_vol: Optional[float]) -> float:
+    """
+    Score a candidate 0.0–1.0 for triage priority based on trendline pattern quality.
+    Higher = more actionable setup, gets priority for expensive options/LLM pass.
+
+    Pattern scoring:
+      broke_above_resistance + volume  → 1.0  (live breakout)
+      near_support (ascending pattern) → 0.85 (ideal entry zone)
+      ascending_triangle / converging_wedge → 0.80 (setup building)
+      ascending_channel near support   → 0.75
+      broke_below_support              → 0.80 (breakdown, put candidate)
+      near_resistance (elevated risk)  → 0.60
+      descending_triangle / channel    → 0.65 (bearish setup)
+      horizontal_range                 → 0.40
+      no trendline data                → 0.0
+    """
+    if not tl:
+        return 0.0
+
+    pattern  = tl.get("pattern", "")
+    near_sup = tl.get("near_support", False)
+    near_res = tl.get("near_resistance", False)
+    broke_up = tl.get("broke_above_resistance", False)
+    broke_dn = tl.get("broke_below_support", False)
+    vol_mult = rel_vol or 1.0
+
+    score = 0.0
+
+    # Breakout signals (highest priority)
+    if broke_up and vol_mult >= 1.5:
+        score = 1.0
+    elif broke_up:
+        score = 0.85
+    elif broke_dn:
+        score = 0.80
+
+    # Near key trendline level
+    elif near_sup and pattern in ("ascending_triangle", "ascending_channel",
+                                   "converging_wedge", "rising_support_flat_resistance"):
+        score = 0.85
+    elif near_res and pattern in ("ascending_triangle", "ascending_channel"):
+        score = 0.60
+
+    # Pattern shape scoring
+    elif pattern in ("converging_wedge", "ascending_triangle"):
+        score = 0.80
+    elif pattern == "ascending_channel":
+        score = 0.70
+    elif pattern in ("descending_triangle", "descending_channel"):
+        score = 0.65
+    elif pattern == "horizontal_range":
+        score = 0.40
+    else:
+        score = 0.30
+
+    return round(score, 3)
+
+
+def _triage_candidates(
+    all_candidates: list[dict],
+    ohlcv_map:      dict[str, list],
+    watchlist:      list[str],
+    pre_filter_n:   int,
+) -> list[dict]:
+    """
+    From the full screener universe, select the best pre_filter_n candidates
+    for expensive per-ticker calls (options chains, news, LLM).
+
+    Scoring = 0.5 × volume_rank_score + 0.5 × trendline_pattern_score
+
+    Watchlist tickers are always included regardless of score.
+    """
+    n = len(all_candidates)
+    if n == 0:
+        return []
+
+    # Run trendline analysis on everyone (pure Python, fast)
+    scored = []
+    for i, c in enumerate(all_candidates):
+        sym = c["symbol"]
+        ohlcv = c.get("ohlcv_30d") or ohlcv_map.get(sym, [])
+        tl    = analyze_trendlines(ohlcv)
+        c["_trendlines_raw"] = tl   # stash for later use
+
+        vol_rank_score = 1.0 - (i / n)   # screener already sorted by rel_vol desc
+        tl_score       = _trendline_prescore(tl, c.get("relative_volume"))
+        combined       = round(0.5 * vol_rank_score + 0.5 * tl_score, 4)
+
+        scored.append((combined, c))
+
+    # Always pull watchlist first, then fill rest by combined score
+    wl_upper   = {s.upper() for s in (watchlist or [])}
+    wl_items   = [(sc, c) for sc, c in scored if c["symbol"] in wl_upper]
+    rest       = [(sc, c) for sc, c in scored if c["symbol"] not in wl_upper]
+    rest.sort(key=lambda x: x[0], reverse=True)
+
+    selected = [c for _, c in wl_items]
+    remaining_slots = max(0, pre_filter_n - len(selected))
+    selected += [c for _, c in rest[:remaining_slots]]
+
+    # Log what was selected and why
+    wl_syms = [c["symbol"] for c in selected if c["symbol"] in wl_upper]
+    top_syms = [c["symbol"] for c in selected if c["symbol"] not in wl_upper]
+    if wl_syms:
+        logger.info(f"Watchlist always-included: {wl_syms}")
+    logger.info(
+        f"Triage selected {len(selected)}/{n} for options fetch — "
+        f"top by score: {top_syms[:10]}"
+    )
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="US Market Scanner")
     parser.add_argument("--context", type=str, default=None,
@@ -608,27 +722,62 @@ def main() -> None:
     if args.top_n:
         config.setdefault("scan", {})["pre_filter_top_n"] = args.top_n
 
+    scan_cfg   = config.get("scan", {})
+    watchlist  = [s.upper() for s in config.get("watchlist", [])]
+    pre_filter = scan_cfg.get("pre_filter_top_n", 20)
+
     # Step 1: Volume scan OR specific symbols
     if args.symbols:
         syms_upper = [s.upper() for s in args.symbols]
-        logger.info(f"Specific-symbol mode: {syms_upper}")
-        candidates, had_errors = get_specific_tickers(syms_upper)
+        # Also include watchlist in --symbols mode
+        all_syms = list(dict.fromkeys(syms_upper + watchlist))
+        logger.info(f"Specific-symbol mode: {syms_upper}  watchlist: {watchlist}")
+        candidates, had_errors = get_specific_tickers(all_syms)
     else:
-        candidates, had_errors = get_volume_leaders(config)
+        all_candidates, had_errors = get_volume_leaders(config)
+        if not all_candidates:
+            logger.info("No candidates today.")
+            _write_output([], args.context, had_errors=had_errors)
+            print("\nNo candidates today — market conditions didn't trigger scan criteria.")
+            return
+
+        # Step 1b: Batch OHLCV for entire screener universe (for trendline triage)
+        all_syms_screener = [c["symbol"] for c in all_candidates]
+        wl_missing = [s for s in watchlist if s not in all_syms_screener]
+        logger.info(
+            f"Fetching 30-day OHLCV for {len(all_syms_screener)} screener candidates"
+            + (f" + {len(wl_missing)} watchlist tickers" if wl_missing else "")
+        )
+        ohlcv_map_all = _fetch_ohlcv_30d(all_syms_screener + wl_missing)
+
+        # Fetch watchlist tickers not in screener results
+        if wl_missing:
+            logger.info(f"Fetching watchlist tickers not in screener: {wl_missing}")
+            wl_candidates, _ = get_specific_tickers(wl_missing)
+            # Patch their OHLCV into the candidates list
+            for c in wl_candidates:
+                c["ohlcv_30d"] = ohlcv_map_all.get(c["symbol"], [])
+            all_candidates = all_candidates + wl_candidates
+
+        # Step 1c: Trendline triage — select best pre_filter_n for expensive calls
+        candidates = _triage_candidates(all_candidates, ohlcv_map_all, watchlist, pre_filter)
+        # Use the per-ticker ohlcv from all_candidates (already patched) for final records
+        ohlcv_map  = {c["symbol"]: ohlcv_map_all.get(c["symbol"], []) for c in candidates}
+        had_errors = had_errors
 
     if not candidates:
-        logger.info("No candidates today.")
+        logger.info("No candidates after triage.")
         _write_output([], args.context, had_errors=had_errors)
         print("\nNo candidates today — market conditions didn't trigger scan criteria.")
         return
 
     symbols = [c["symbol"] for c in candidates]
 
-    # Step 2: Earnings check
+    # Step 2: Earnings check (only for triaged set)
     logger.info(f"Checking earnings for: {symbols}")
     earnings = check_earnings(symbols)
 
-    # Step 3: Options chains
+    # Step 3: Options chains (only for triaged set — this is the expensive step)
     logger.info(f"Fetching options for: {symbols}")
     options = get_options_data(symbols)
 
@@ -640,9 +789,11 @@ def main() -> None:
     logger.info(f"Fetching 5-day returns for: {symbols}")
     returns_5d = get_5day_returns(symbols)
 
-    # Step 5b: Last-30-day OHLCV (for backtest.py; skip if already in candidate from yfinance path)
-    logger.info(f"Fetching 30-day OHLCV for: {symbols}")
-    ohlcv_map = _fetch_ohlcv_30d(symbols)
+    # Step 5b: OHLCV — fetch for --symbols mode; triage path already built ohlcv_map
+    if args.symbols:
+        logger.info(f"Fetching 30-day OHLCV for: {symbols}")
+        ohlcv_map = _fetch_ohlcv_30d(symbols)
+    # else: ohlcv_map already set from triage batch fetch above
 
     # Step 6: Drop tickers with no listed options (skip in --symbols mode — user asked explicitly)
     if not args.symbols:
@@ -700,8 +851,10 @@ def main() -> None:
             },
             # Last 30 days of OHLCV for backtest / reflect.py pattern validation
             "ohlcv":    c.get("ohlcv_30d") or ohlcv_map.get(sym, []),
-            # Trendline analysis derived from OHLCV
-            "trendlines": analyze_trendlines(c.get("ohlcv_30d") or ohlcv_map.get(sym, [])),
+            # Trendline analysis — reuse from triage pass if available
+            "trendlines": c.get("_trendlines_raw") or analyze_trendlines(
+                c.get("ohlcv_30d") or ohlcv_map.get(sym, [])
+            ),
             # News
             "news": news.get(sym, []),
         })
