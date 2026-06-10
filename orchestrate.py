@@ -692,11 +692,28 @@ def score_candidates(
     session_note:    str = "",
     force_heuristic: bool = False,
 ) -> list[dict]:
-    """Score all candidates. Use LLM when available, fall back per-ticker."""
+    """Score all candidates. Use LLM when available, fall back per-ticker.
+    Batches into groups of 8 so the LLM JSON response never overflows."""
+    LLM_BATCH_SIZE = 8
     llm_results: list[dict] = []
     if not force_heuristic:
-        llm_results = llm_score(tickers, frameworks, config, context,
-                                session_note=session_note)
+        if len(tickers) <= LLM_BATCH_SIZE:
+            llm_results = llm_score(tickers, frameworks, config, context,
+                                    session_note=session_note)
+        else:
+            # Split into batches to avoid LLM response truncation
+            batches = [tickers[i:i+LLM_BATCH_SIZE]
+                       for i in range(0, len(tickers), LLM_BATCH_SIZE)]
+            logger.info(
+                f"Large candidate set ({len(tickers)}): splitting into "
+                f"{len(batches)} LLM batches of ≤{LLM_BATCH_SIZE}"
+            )
+            for i, batch in enumerate(batches, 1):
+                batch_syms = [t["symbol"] for t in batch]
+                logger.info(f"  Batch {i}/{len(batches)}: {batch_syms}")
+                batch_results = llm_score(batch, frameworks, config, context,
+                                          session_note=session_note)
+                llm_results.extend(batch_results)
 
     llm_map: dict[str, dict] = {}
     for ev in llm_results:
