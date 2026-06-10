@@ -33,7 +33,7 @@
     "min_score": 0.60,
     "max_daily_candidates": 2
   },
-  "watchlist": ["MU", "AAOI", "NVDA", "TSLA", "MRVL"],
+  "watchlist": ["SPY", "QQQ", "IWM", "MU", "AAOI", "NVDA", "TSLA", "MRVL"],
   "options": {
     "preferred_dte": "7-14 days",
     "comment": "Short-term focus: 1-2 week options to keep premiums low on a small budget",
