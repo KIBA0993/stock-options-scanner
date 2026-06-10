@@ -30,6 +30,8 @@ import pandas as pd
 import yfinance as yf
 from tradingview_screener import Column, Query
 
+from trendlines import analyze_trendlines
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -698,6 +700,8 @@ def main() -> None:
             },
             # Last 30 days of OHLCV for backtest / reflect.py pattern validation
             "ohlcv":    c.get("ohlcv_30d") or ohlcv_map.get(sym, []),
+            # Trendline analysis derived from OHLCV
+            "trendlines": analyze_trendlines(c.get("ohlcv_30d") or ohlcv_map.get(sym, [])),
             # News
             "news": news.get(sym, []),
         })
