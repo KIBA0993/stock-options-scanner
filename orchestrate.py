@@ -237,6 +237,10 @@ def _ticker_summary(t: dict) -> str:
     news_str = "; ".join(n.get("title", "") for n in news[:3]) if news else "No recent news"
     change   = t.get("change_pct", 0) or 0
 
+    tl       = t.get("trendlines", {})
+    tl_str   = tl.get("trendline_summary", "")
+    tl_block = f"Trendlines: {tl_str}\n" if tl_str and tl_str != "insufficient data" else ""
+
     return (
         f"Symbol: {t['symbol']} ({t.get('name', '')})\n"
         f"Price: ${t.get('price', 0):.2f} ({change:+.1f}%)\n"
@@ -248,6 +252,7 @@ def _ticker_summary(t: dict) -> str:
         f"Options Flow: call {t.get('options_call_volume', 0):,} / "
         f"put {t.get('options_put_volume', 0):,}  (C/P: {cp_str})\n"
         f"Earnings in 48h: {'YES ⚠️' if t.get('earnings_within_48h') else 'No'}\n"
+        f"{tl_block}"
         f"Recent News: {news_str}"
     )
 
@@ -310,6 +315,13 @@ RULES:
 10. Earnings in 48h → penalise score heavily unless setup specifically targets earnings gap
 11. entry_note/stop_note/target_note: reference the STOCK price (not option premium) for levels.
     Option premium stop = 40-50% loss of premium paid. Be specific about price levels when possible.
+12. Trendlines (if present): use support_TL/resist_TL levels as entry, stop, and target anchors.
+    - near_support + CALL setup: ideal entry zone (price bouncing off rising support TL)
+    - near_resistance + CALL setup: risk of rejection — lower score or tighten target
+    - broke_above_resistance: potential breakout — confirm with volume before scoring high
+    - broke_below_support: bearish breakdown — consider PUT direction
+    - Pattern names: ascending_channel/triangle = bullish bias; descending = bearish;
+      converging_wedge = imminent breakout either way
 """
 
 
