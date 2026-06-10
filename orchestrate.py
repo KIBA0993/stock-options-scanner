@@ -762,6 +762,14 @@ def pick_option_contract(
     today = date.today()
     raw_contracts = options_chain.get("calls" if direction == "call" else "puts", [])
 
+    # Per-tier max bid/ask spread (as % of mid)
+    spread_cfg = (config or {}).get("options", {}).get("max_spread_pct", {})
+    max_spread = {
+        "atm":        float(spread_cfg.get("atm",        20)),
+        "slight_otm": float(spread_cfg.get("slight_otm", 25)),
+        "affordable": float(spread_cfg.get("affordable", 35)),
+    }
+
     def _mid(c: dict) -> float:
         """Use live bid/ask mid ONLY. Never fall back to lastPrice — it's yesterday's close."""
         bid = float(c.get("bid") or 0)
@@ -830,19 +838,43 @@ def pick_option_contract(
             ),
         }
 
-    def _best_in_band(lo_pct: float, hi_pct: float) -> Optional[dict]:
-        """Best (most liquid) contract with OTM% in [lo_pct, hi_pct]."""
+    def _spread_ok(c: dict, tier: str) -> bool:
+        """True if the contract's bid/ask spread is within the tier's threshold."""
+        bid = float(c.get("bid") or 0)
+        ask = float(c.get("ask") or 0)
+        mid = (bid + ask) / 2 if bid > 0.01 and ask > 0.01 else 0
+        if mid <= 0:
+            return False
+        sp_pct = (ask - bid) / mid * 100
+        return sp_pct <= max_spread[tier]
+
+    def _best_in_band(lo_pct: float, hi_pct: float, tier: str) -> Optional[dict]:
+        """Best (most liquid) contract in OTM band that passes the spread filter.
+        Falls back to tightest-spread contract in band if none pass the threshold."""
         band = [
             c for c in candidates
             if lo_pct <= _pct_otm(float(c.get("strike", 0) or 0)) <= hi_pct
         ]
         if not band:
             return None
-        return _contract_info(max(band, key=lambda c: int(c.get("volume") or c.get("vol") or 0)))
+
+        liquid = [c for c in band if _spread_ok(c, tier)]
+        pool   = liquid if liquid else band   # fallback: best of bad options
+
+        best = max(pool, key=lambda c: int(c.get("volume") or c.get("vol") or 0))
+        info = _contract_info(best)
+
+        # Warn if we had to fall back to a wide-spread contract
+        if not liquid:
+            info["spread_warning"] = (
+                f"No contracts in this band pass the {max_spread[tier]:.0f}% spread limit — "
+                f"showing tightest available. Consider skipping this tier."
+            )
+        return info
 
     def _most_affordable() -> Optional[dict]:
-        """Most affordable contract within a reasonable OTM band (≤30% OTM).
-        Prefers contracts within budget; if none fit, returns cheapest in band."""
+        """Most affordable contract within ≤30% OTM that passes spread filter.
+        Falls back to cheapest in band if none pass threshold."""
         reasonable = [
             c for c in candidates
             if 0 <= _pct_otm(float(c.get("strike", 0) or 0)) <= 30
@@ -850,18 +882,25 @@ def pick_option_contract(
         if not reasonable:
             reasonable = candidates
 
-        within_budget = [c for c in reasonable if _mid(c) * 100 <= budget]
-        pool = within_budget if within_budget else reasonable
-        return _contract_info(min(pool, key=lambda c: _mid(c) * 100))
+        liquid = [c for c in reasonable if _spread_ok(c, "affordable")]
+        pool   = liquid if liquid else reasonable
+
+        within_budget = [c for c in pool if _mid(c) * 100 <= budget]
+        final_pool    = within_budget if within_budget else pool
+
+        best = min(final_pool, key=lambda c: _mid(c) * 100)
+        info = _contract_info(best)
+
+        if not liquid:
+            info["spread_warning"] = (
+                f"No affordable contracts pass the {max_spread['affordable']:.0f}% spread limit — "
+                f"showing cheapest available. This tier may be untradeable."
+            )
+        return info
 
     # Build the three tiers
-    if direction == "call":
-        atm_tier        = _best_in_band(-3,   3)   # ATM ±3%
-        slight_otm_tier = _best_in_band( 5,  12)   # 5–12% OTM
-    else:
-        atm_tier        = _best_in_band(-3,   3)   # ATM ±3%
-        slight_otm_tier = _best_in_band( 5,  12)   # 5–12% OTM
-
+    atm_tier        = _best_in_band(-3,  3,  "atm")
+    slight_otm_tier = _best_in_band( 5, 12,  "slight_otm")
     affordable_tier = _most_affordable()
 
     # Deduplicate: if affordable is same strike as a tier already shown, skip it
@@ -919,6 +958,9 @@ def _fetch_live_contracts(
             df = chain.calls if direction == "call" else chain.puts
             # Require live bid>0 — lastPrice is yesterday's close, not tradeable
             df = df[df["bid"] > 0.05].copy()
+            # Filter to ±35% OTM — excludes deep ITM and lottery-ticket far OTM
+            if price > 0:
+                df = df[abs(df["strike"] - price) / price <= 0.35].copy()
             for _, row in df.iterrows():
                 def _safe_int(v):
                     try:
@@ -1041,6 +1083,8 @@ def print_results(
                     t = rc["tiers"].get(key)
                     if t:
                         print(f"       {label}: {t['label']}")
+                        if t.get("spread_warning"):
+                            print(f"                  ⚠ {t['spread_warning']}")
 
     # Summary of non-alert candidates
     below   = [s for s in all_scored if s["direction"] != "skip" and s not in alerts]
