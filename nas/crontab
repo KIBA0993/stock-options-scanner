@@ -6,6 +6,9 @@
 # 9:45 AM — morning digest (always emails on trading days)
 45 9 * * 1-5 /data/trading/nas/scripts/morning_digest_runner.sh
 
+# 10:05 AM — reprice backfill (fills contracts the 9:45 scan couldn't price yet)
+5 10 * * 1-5 /data/trading/nas/scripts/reprice_runner.sh
+
 # 12:45 PM — midday swing scan (email on new alerts)
 45 12 * * 1-5 /data/trading/nas/scripts/scan_runner.sh
 

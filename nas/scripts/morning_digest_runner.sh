@@ -27,6 +27,8 @@ HC="$TRADING_DIR/nas/scripts/healthcheck.sh"
 
 "$PYTHON" scanner.py    >> "$LOG_FILE" 2>&1 || true
 "$PYTHON" orchestrate.py >> "$LOG_FILE" 2>&1 || true
+# Backfill live option contracts — the 9:45 scan can precede settled options pricing.
+"$PYTHON" reprice.py    >> "$LOG_FILE" 2>&1 || true
 "$PYTHON" notify.py --morning-digest --channel email >> "$LOG_FILE" 2>&1
 
 EXIT_CODE=$?
