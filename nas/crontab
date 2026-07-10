@@ -1,0 +1,29 @@
+# ET schedule — container TZ=America/New_York
+# Swing scans + intraday skip weekends and NYSE holidays.
+
+# Vertex validated on container start via entrypoint.sh (supercronic does not support @reboot)
+
+# 9:45 AM — morning digest (always emails on trading days)
+45 9 * * 1-5 /data/trading/nas/scripts/morning_digest_runner.sh
+
+# 12:45 PM — midday swing scan (email on new alerts)
+45 12 * * 1-5 /data/trading/nas/scripts/scan_runner.sh
+
+# 0–1 DTE intraday — every 10 min on trading days
+40,50 9 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh
+*/10 10-14 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh
+0,10,20,30,40,50 15 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh
+
+# 5-min telemetry snapshots (framework backtest data; no alerts)
+45,55 9 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh bash /data/trading/nas/scripts/intraday_telemetry_runner.sh
+5,15,25,35,45,55 10-14 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh bash /data/trading/nas/scripts/intraday_telemetry_runner.sh
+5,15,25,35,45,55 15 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh bash /data/trading/nas/scripts/intraday_telemetry_runner.sh
+
+# 4:15 PM — daily 0DTE review (trading days)
+15 16 * * 1-5 /data/trading/nas/scripts/intraday_reflect_runner.sh
+
+# 4:20 PM — framework backtest report (needs telemetry from same day)
+20 16 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh bash /data/trading/nas/scripts/framework_backtest_runner.sh
+
+# 5:15 PM Friday — weekly swing alert review (runs on holiday Fridays too)
+15 17 * * 5 /data/trading/nas/scripts/weekly_reflect_runner.sh

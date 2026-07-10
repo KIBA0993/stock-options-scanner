@@ -1,0 +1,33 @@
+# Synology DS920+ — Container Manager
+# Deploy path on NAS: /volume1/docker/trading
+#
+# Usage (on NAS, after files are synced):
+#   cd /volume1/docker/trading/nas
+#   sudo docker compose up -d --build
+
+services:
+  trading-scanner:
+    build:
+      context: ..
+      dockerfile: nas/Dockerfile
+    image: trading-scanner:latest
+    container_name: trading-scanner
+    restart: unless-stopped
+    environment:
+      HOME: /data
+      TZ: America/New_York
+    volumes:
+      # Persistent data: config, creators, scan output, logs
+      - ../:/data/trading
+      # Schedule + runner scripts apply on container restart (no image rebuild)
+      - ./crontab:/etc/crontab:ro
+      - ./scripts:/scripts:ro
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    healthcheck:
+      test: ["CMD", "/scripts/healthcheck.sh"]
+      interval: 10m
+      timeout: 30s
+      retries: 3
+      start_period: 60s
