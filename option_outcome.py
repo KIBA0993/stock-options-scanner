@@ -31,20 +31,12 @@ def pick_contract_tier(alert: dict, prefer: str = "atm") -> Optional[dict]:
 
 
 def underlying_close_on(symbol: str, on_date: date) -> Optional[float]:
+    # Routed through market_data so a configured fallback provider (Tiingo) can
+    # cover yfinance gaps. With no fallback key set, this is yfinance-only —
+    # identical to the previous behavior.
     try:
-        end = on_date + timedelta(days=5)
-        hist = yf.Ticker(symbol).history(
-            start=on_date.isoformat(),
-            end=end.isoformat(),
-            interval="1d",
-            auto_adjust=True,
-        )
-        if hist is None or hist.empty:
-            return None
-        day_rows = hist[hist.index.date == on_date]
-        if day_rows.empty:
-            day_rows = hist.head(1)
-        return float(day_rows["Close"].iloc[-1])
+        from market_data import get_daily_close
+        return get_daily_close(symbol, on_date)
     except Exception as exc:
         logger.warning(f"Underlying close failed for {symbol} on {on_date}: {exc}")
         return None
