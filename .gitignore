@@ -1,5 +1,7 @@
 # ── Sensitive / secrets ─────────────────────────────────────────────────────
 config.json            # contains API keys — copy from config.json.template
+secrets/               # GCP service account JSON (gitignored)
+nas/nas.env            # NAS host/user — copy from nas.env.example
 
 # ── Runtime data (regenerated on each run) ───────────────────────────────────
 data/

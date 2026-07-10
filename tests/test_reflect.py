@@ -48,6 +48,9 @@ def tmp_trading(tmp_path, monkeypatch):
     monkeypatch.setattr(reflect, "CREATORS_DIR", tmp_path / "creators")
     monkeypatch.setattr(reflect, "JOURNAL_PATH", tmp_path / "data" / "trade_journal.jsonl")
     monkeypatch.setattr(reflect, "HISTORY_PATH", tmp_path / "data" / "reflect_history.jsonl")
+    monkeypatch.setattr(utils, "DATA_DIR",       tmp_path / "data")
+    monkeypatch.setattr(utils, "SENT_PATH",      tmp_path / "data" / "sent_history.json")
+    monkeypatch.setattr(utils, "ARCHIVE_DIR",    tmp_path / "data" / "archive")
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
     (tmp_path / "creators").mkdir(parents=True, exist_ok=True)
@@ -513,9 +516,49 @@ class TestProcessWeekIdempotency:
         existing = make_skip_record(week_start=week_start.isoformat())
         reflect.append_history([existing])
 
-        # No archive files → still returns empty but doesn't raise
+        # No archive files → archive pass empty; no sent_history → sent pass empty
         result = reflect.process_week(week_start, force=True)
         assert result == []
+
+    def test_sent_alerts_processed_independently(self, tmp_trading, monkeypatch):
+        week_start = date(2026, 6, 9)
+        reflect.append_history([make_skip_record(week_start=week_start.isoformat())])
+
+        sent_path = tmp_trading / "data" / "sent_history.json"
+        sent_path.write_text(json.dumps({
+            "TNGX:call:ts": {
+                "symbol": "TNGX", "direction": "call", "score": 0.8,
+                "sent_at": "2026-06-09T13:41:42+00:00", "channels": ["email"],
+            }
+        }))
+
+        monkeypatch.setattr(reflect, "evaluate_swing_alert", lambda alert, d, cfg=None, as_of=None: {
+            "miss_type": "correct_take",
+            "outcome_5d_pct": 25.0,
+            "outcome_option_pnl_pct": 25.0,
+            "outcome_underlying_pct": 5.0,
+            "outcome_pending": True,
+            "outcome_interim": True,
+            "outcome_final": False,
+            "outcome_as_of": "2026-06-19",
+            "option_target_exit_date": "2026-06-23",
+        })
+        result = reflect.process_sent_alerts(week_start, force=False)
+        assert len(result) == 1
+        assert result[0]["source"] == "sent_alert"
+        assert result[0]["miss_type"] == "correct_take"
+        assert result[0]["outcome_option_pnl_pct"] == 25.0
+        assert result[0]["outcome_interim"] is True
+
+        # Interim scores refresh on re-run
+        reflect.upsert_sent_alert_records(result)
+        again = reflect.process_sent_alerts(week_start, force=False)
+        assert len(again) == 1
+
+        # Final scores are idempotent
+        final = [{**result[0], "outcome_final": True, "outcome_interim": False}]
+        reflect.upsert_sent_alert_records(final)
+        assert reflect.process_sent_alerts(week_start, force=False) == []
 
 
 # ─── Fetch outcome ──────────────────────────────────────────────────────────────

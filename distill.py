@@ -23,10 +23,12 @@ Post collection:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -146,6 +148,66 @@ doesn't document, areas where the framework is thin or uncertain.]
 """
 
 
+IMAGE_ANALYSIS_PROMPT = """\
+This image was posted by trader {handle} on {date} with the caption:
+"{tweet_text}"
+
+You are analyzing this chart image to extract trading methodology.
+
+Answer ALL of the following — mark "Not visible" if you can't determine it:
+
+1. CHART TYPE: Is this a single chart, or two charts being compared side by side (historical analog)?
+
+2. IF HISTORICAL ANALOG (two charts compared):
+   - Asset in current chart:
+   - Current time period shown:
+   - Historical period being compared to:
+   - What pattern is repeating? (e.g. "bull flag consolidation before breakout", "rounding bottom", "ascending triangle")
+   - Predicted outcome based on the analog:
+   - Any price targets or levels shown?
+
+3. IF SINGLE CHART:
+   - Asset:
+   - Timeframe (1m, 5m, 1h, daily, weekly):
+   - Pattern identified (describe what you see):
+   - Key levels marked (support, resistance, targets):
+   - Trend direction implied:
+   - Any annotations, arrows, or text drawn on the chart?
+
+4. TRADING SIGNAL: What trade does this chart image suggest? (calls/puts, long/short, wait, etc.)
+
+5. TRANSFERABLE INSIGHT: In 1-2 sentences, what general trading methodology principle does this image demonstrate that could apply to any stock or asset?
+"""
+
+IMAGE_SUMMARY_PROMPT = """\
+Below are insights extracted from {n} chart images posted by trader {handle}.
+Synthesize these into a "Visual Chart Analysis" section for their trading framework.
+
+Focus on:
+- Recurring patterns they use (historical analogs, specific chart formations)
+- How they identify and use historical pattern comparisons
+- Their preferred timeframes for visual analysis
+- Any stocks or assets they repeatedly chart (beyond crypto)
+- The general methodology behind their visual pattern recognition
+
+Image insights:
+{insights_text}
+
+Write a ## Visual Chart Analysis section with subsections:
+### Historical Analog Method
+[How they compare current charts to historical periods]
+
+### Recurring Chart Patterns
+[List the most common patterns found in their images]
+
+### Transferable Methodology (Non-Crypto)
+[What visual analysis techniques work for any asset, including US stocks]
+
+### Sample Visual Setups (from images)
+[2-3 specific examples from the image analysis with dates]
+"""
+
+
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
 
@@ -164,8 +226,11 @@ def call_llm(prompt: str, config: dict) -> str:
     api_key  = llm_cfg.get("api_key", "")
     model    = llm_cfg.get("model", "claude-opus-4-5")
 
-    # Auto-route to Ollama if no API key is configured
-    if provider == "ollama" or (not api_key or api_key == "PLACEHOLDER"):
+    # Auto-route to Ollama if no API key is configured (non-Vertex providers)
+    if provider == "ollama" or (
+        provider != "vertex"
+        and (not api_key or api_key == "PLACEHOLDER")
+    ):
         ollama_model = llm_cfg.get("ollama_model", "qwen2.5:14b")
         if _ollama_running():
             logger.info(f"Using local Ollama ({ollama_model}) for distillation.")
@@ -188,6 +253,13 @@ def call_llm(prompt: str, config: dict) -> str:
     elif provider == "openai_compatible":
         return _call_openai(prompt, api_key, model, config,
                             base_url=config.get("llm", {}).get("base_url"))
+    elif provider == "vertex":
+        from vertex_llm import is_vertex_configured, vertex_chat
+        if not is_vertex_configured(llm_cfg):
+            logger.error("Vertex AI: set llm.project_id and auth (adc or service account JSON)")
+            sys.exit(1)
+        logger.info(f"Calling Vertex AI ({llm_cfg.get('model', 'gemini-2.5-flash')})…")
+        return vertex_chat(prompt, SYSTEM_PROMPT, llm_cfg, stream=True)
     else:
         logger.error(f"Unknown LLM provider: {provider}")
         sys.exit(1)
@@ -226,16 +298,23 @@ def _call_openai(prompt: str, api_key: str, model: str, config: dict, base_url: 
         kwargs["base_url"] = base_url
     client = OpenAI(**kwargs)
 
-    logger.info(f"Calling OpenAI-compatible API ({model})...")
-    response = client.chat.completions.create(
+    logger.info(f"Calling OpenAI-compatible API ({model}) via streaming…")
+    # Use streaming to avoid server-side 60s timeout on long generations
+    chunks = []
+    with client.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
+        stream=True,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": prompt},
         ],
-    )
-    return response.choices[0].message.content
+    ) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                chunks.append(delta)
+    return "".join(chunks)
 
 
 def _call_ollama(prompt: str, model: str, config: dict) -> str:
@@ -260,6 +339,204 @@ def _call_ollama(prompt: str, model: str, config: dict) -> str:
         ],
     )
     return response.choices[0].message.content
+
+
+# ---------------------------------------------------------------------------
+# Image / Vision analysis
+# ---------------------------------------------------------------------------
+
+def _fetch_image_b64(url: str) -> tuple[str, str] | None:
+    """Download an image URL and return (base64_data, media_type). Returns None on failure."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            return base64.b64encode(data).decode(), content_type
+    except Exception as exc:
+        logger.warning(f"Could not fetch image {url}: {exc}")
+        return None
+
+
+def _call_vision_llm(tweet_text: str, image_b64: str, media_type: str,
+                     date: str, handle: str, config: dict) -> str:
+    """Send a tweet + chart image to Claude Vision and return the analysis."""
+    llm_cfg  = config.get("llm", {})
+    api_key  = llm_cfg.get("api_key", "")
+    model    = llm_cfg.get("model", "claude-sonnet-4-5")
+    provider = llm_cfg.get("provider", "anthropic")
+
+    prompt_text = IMAGE_ANALYSIS_PROMPT.format(
+        handle=f"@{handle}", date=date, tweet_text=tweet_text[:300]
+    )
+
+    try:
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }],
+            )
+            return response.content[0].text
+        elif provider == "vertex":
+            from vertex_llm import vertex_vision
+            return vertex_vision(prompt_text, image_b64, media_type, llm_cfg)
+        else:
+            # OpenAI-compatible: mammouth, openai, openai_compatible
+            from openai import OpenAI
+            base_url = None
+            if provider == "mammouth":
+                base_url = "https://api.mammouth.ai/v1"
+            elif provider == "openai_compatible":
+                base_url = llm_cfg.get("base_url")
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{media_type};base64,{image_b64}"
+                        }},
+                    ],
+                }],
+            )
+            return response.choices[0].message.content
+    except Exception as exc:
+        logger.warning(f"Vision LLM call failed: {exc}")
+        return ""
+
+
+def _extract_image_lines(posts_text: str) -> list[dict]:
+    """
+    Parse posts_raw.txt and return list of dicts for posts with images:
+    {date, tweet_text, image_urls, likes}
+    Only returns posts with chart-related keywords to skip unrelated images.
+    """
+    CHART_KEYWORDS = re.compile(
+        r"pattern|similar|analog|like 20\d\d|reminds|fractal|repeat|"
+        r"looks like|compare|chart|setup|breakout|resistance|support|"
+        r"target|level|rsi|ema|macd|bull|bear|wedge|triangle|channel|flag|"
+        r"bounce|rejection|retest|consolidat",
+        re.IGNORECASE
+    )
+    results = []
+    lines   = posts_text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Match a post header line like [2026-05-22] (likes:617 rt:63) text...
+        m = re.match(r"^\[(\d{4}-\d{2}-\d{2})\]\s+\(likes:(\d+).*?\)\s+(.*)", line)
+        if m:
+            date  = m.group(1)
+            likes = int(m.group(2))
+            text  = m.group(3)
+            # Check if next line is [IMAGES: ...]
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("[IMAGES:"):
+                img_line = lines[i + 1].strip()
+                urls_str = re.sub(r"^\[IMAGES:\s*", "", img_line).rstrip("]")
+                image_urls = [u.strip() for u in urls_str.split(",") if u.strip()]
+                # Only keep if tweet text has chart-related content
+                if image_urls and (CHART_KEYWORDS.search(text) or likes >= 50):
+                    results.append({
+                        "date": date, "tweet_text": text,
+                        "image_urls": image_urls, "likes": likes,
+                    })
+                i += 2
+                continue
+        i += 1
+
+    # Sort by likes descending so we process the most impactful posts first
+    results.sort(key=lambda x: x["likes"], reverse=True)
+    return results
+
+
+def analyze_chart_images(posts_text: str, handle: str, config: dict,
+                         max_images: int = 40) -> str:
+    """
+    Find posts with chart images, analyze each via Claude Vision,
+    then synthesize a visual methodology section.
+
+    Returns the synthesized markdown section, or "" if no images found.
+    """
+    image_posts = _extract_image_lines(posts_text)
+    if not image_posts:
+        logger.info(f"No chart images found in posts for @{handle}")
+        return ""
+
+    total_images = sum(len(p["image_urls"]) for p in image_posts)
+    logger.info(
+        f"Found {len(image_posts)} posts with chart images "
+        f"({total_images} total) for @{handle}. Analyzing top {max_images}…"
+    )
+
+    insights = []
+    analyzed = 0
+    for post in image_posts:
+        if analyzed >= max_images:
+            break
+        for img_url in post["image_urls"]:
+            if analyzed >= max_images:
+                break
+            logger.info(f"  Analyzing image {analyzed + 1}/{max_images}: {img_url[:60]}…")
+            result = _fetch_image_b64(img_url)
+            if not result:
+                continue
+            b64, media_type = result
+            analysis = _call_vision_llm(
+                tweet_text=post["tweet_text"],
+                image_b64=b64,
+                media_type=media_type,
+                date=post["date"],
+                handle=handle,
+                config=config,
+            )
+            if analysis:
+                insights.append(
+                    f"--- Image from {post['date']} (likes:{post['likes']}) ---\n"
+                    f"Tweet: {post['tweet_text'][:200]}\n"
+                    f"Analysis:\n{analysis}\n"
+                )
+            analyzed += 1
+            time.sleep(0.5)   # avoid rate limiting
+
+    if not insights:
+        logger.info(f"No successful image analyses for @{handle}")
+        return ""
+
+    logger.info(f"Synthesizing {len(insights)} image analyses for @{handle}…")
+    summary_prompt = IMAGE_SUMMARY_PROMPT.format(
+        handle=f"@{handle}",
+        n=len(insights),
+        insights_text="\n\n".join(insights[:30]),  # cap to avoid context overflow
+    )
+    try:
+        # Re-use call_llm so synthesis always uses the configured provider
+        return call_llm(summary_prompt, config)
+    except Exception as exc:
+        logger.warning(f"Image synthesis failed: {exc}")
+        return "\n".join(insights)   # fallback: return raw insights
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +604,12 @@ def main() -> None:
                         help="Path to file containing raw X posts (default: auto-detect posts_raw.txt)")
     parser.add_argument("--refresh", action="store_true",
                         help="Force new version even if framework-v1.md already exists")
+    parser.add_argument("--analyze-images", action="store_true",
+                        help="Download and analyze chart images via Claude Vision (requires image URLs in posts_raw.txt)")
+    parser.add_argument("--max-images", type=int, default=40,
+                        help="Max chart images to analyze (default: 40)")
+    parser.add_argument("--provider", default=None,
+                        help="Override LLM provider: ollama | mammouth | anthropic | openai")
     args = parser.parse_args()
 
     handle       = args.handle.lstrip("@")
@@ -366,6 +649,9 @@ Then re-run:
         logger.warning(f"Truncated to {max_chars:,} chars to fit LLM context window")
 
     config  = load_config()
+    if args.provider:
+        config.setdefault("llm", {})["provider"] = args.provider
+        logger.info(f"LLM provider overridden to: {args.provider}")
     version = next_version(creator_dir) if args.refresh else (next_version(creator_dir) if next_version(creator_dir) == 1 else None)
 
     if version is None:
@@ -375,8 +661,33 @@ Then re-run:
         print("Use --refresh to create a new version from updated posts.")
         sys.exit(0)
 
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    prompt  = EXTRACTION_PROMPT.format(
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # --- Optional: image analysis via Claude Vision ---
+    visual_section = ""
+    image_cache_path = creator_dir / "image_analysis_cache.md"
+    if args.analyze_images:
+        # Use cached result if it exists from a previous run today (avoids re-analyzing on retry)
+        if image_cache_path.exists():
+            cached = image_cache_path.read_text(encoding="utf-8")
+            if cached.strip():
+                logger.info(f"Using cached image analysis from {image_cache_path}")
+                visual_section = cached
+        if not visual_section:
+            logger.info(f"Running image analysis for @{handle} (max {args.max_images} images)…")
+            visual_section = analyze_chart_images(
+                posts_text=raw_text,        # use raw_text (has [IMAGES: ...] lines)
+                handle=handle,
+                config=config,
+                max_images=args.max_images,
+            )
+            if visual_section:
+                image_cache_path.write_text(visual_section, encoding="utf-8")
+                logger.info("Image analysis complete — cached and including visual section in framework.")
+            else:
+                logger.info("No image insights found. Continuing with text-only distillation.")
+
+    prompt = EXTRACTION_PROMPT.format(
         handle=f"@{handle}",
         posts_text=posts_text,
         today=today,
@@ -385,6 +696,10 @@ Then re-run:
 
     logger.info(f"Distilling @{handle} → framework-v{version}.md ...")
     framework_text = call_llm(prompt, config)
+
+    # Append the visual section separately so Claude's token limit doesn't cut it off
+    if visual_section and "## Visual Chart Analysis" not in framework_text:
+        framework_text = framework_text.rstrip() + "\n\n## Visual Chart Analysis\n" + visual_section
 
     out_path = creator_dir / f"framework-v{version}.md"
     out_path.write_text(framework_text, encoding="utf-8")

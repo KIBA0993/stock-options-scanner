@@ -137,10 +137,13 @@ python reflect.py --auto                 # full run (same as Friday launchd)
 
 | Provider | Config | Cost |
 |---|---|---|
+| **Vertex AI (Gemini 2.5 Flash)** | `provider: vertex`, GCP service account JSON | ~$1–3/mo |
 | Mammouth AI (Claude) | `provider: mammouth`, key from [mammouth.ai](https://mammouth.ai) | Low |
 | Anthropic (Claude) | `provider: anthropic`, key from console.anthropic.com | Moderate |
 | Ollama (local) | `provider: ollama`, install from [ollama.ai](https://ollama.ai) | Free |
-| Heuristic fallback | `--no-llm` flag or no key configured | Free |
+| Heuristic fallback | `--no-llm` flag or no credentials configured | Free |
+
+**Vertex setup:** save service account JSON to `secrets/gcp-sa.json`, project `stock-500202`, role `Vertex AI User`. See `secrets/README.md`.
 
 ## Data files (not committed)
 
@@ -160,6 +163,17 @@ python reflect.py --auto                 # full run (same as Friday launchd)
 ```bash
 pytest tests/ -q
 ```
+
+## NAS deployment (Synology DS920+)
+
+For stable wired ethernet and always-on scheduled scans, deploy to your NAS:
+
+```bash
+cp nas/nas.env.example nas/nas.env   # set NAS_HOST, NAS_USER
+./nas/deploy-to-nas.sh --test-scan
+```
+
+See [nas/README.md](nas/README.md) for full setup (network DNS, Container Manager, disabling Mac launchd jobs).
 
 ## Disclaimer
 

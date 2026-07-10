@@ -46,7 +46,7 @@ import json
 import logging
 import smtplib
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from logging.handlers import TimedRotatingFileHandler
@@ -60,6 +60,7 @@ CONFIG_PATH  = BASE_DIR / "config.json"
 ALERTS_PATH  = DATA_DIR / "alerts.json"
 BUDGET_PATH  = DATA_DIR / "budget.json"
 SENT_PATH    = DATA_DIR / "sent_history.json"   # deduplication log
+INTRADAY_SENT_PATH = DATA_DIR / "intraday_sent_history.json"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -113,8 +114,19 @@ def load_sent_history() -> dict:
 
 
 def _fingerprint(alert: dict, scan_ts: str) -> str:
-    """Unique identifier for an alert — symbol + direction + scan timestamp."""
-    return f"{alert['symbol']}:{alert['direction']}:{scan_ts}"
+    """Unique identifier for an alert — symbol + direction + calendar date.
+    Using date (not full timestamp) prevents the same trade being re-sent on
+    multiple scans throughout the same day.
+    """
+    day = scan_ts[:10] if scan_ts else date.today().isoformat()
+    return f"{alert['symbol']}:{alert['direction']}:{day}"
+
+
+def _has_contracts(alert: dict) -> bool:
+    """Return True if this alert has at least one priced option tier."""
+    rc = alert.get("recommended_contract") or {}
+    tiers = rc.get("tiers") or {}
+    return any(tiers.get(k) for k in ("atm", "slight_otm", "affordable"))
 
 
 def filter_new_alerts(
@@ -123,15 +135,32 @@ def filter_new_alerts(
     history: dict,
     force: bool,
 ) -> list[dict]:
-    """Return only alerts that haven't been sent yet (unless --force)."""
+    """Return only alerts that haven't been sent yet (unless --force).
+
+    Alerts without priced contracts are still sent — the email will include a
+    note that option pricing is unavailable yet (market likely pre-9:45 AM ET).
+    """
     if force:
         logger.info("--force flag: resending all alerts")
         return alerts
-    new = [a for a in alerts if _fingerprint(a, scan_ts) not in history]
-    skipped = len(alerts) - len(new)
+
+    result = []
+    for a in alerts:
+        fp = _fingerprint(a, scan_ts)
+        if fp in history:
+            logger.info(f"Skipping {a['symbol']} — already sent today")
+            continue
+        if not _has_contracts(a):
+            logger.info(
+                f"{a['symbol']} has no priced contracts — sending with note "
+                "(options market not fully open yet)"
+            )
+        result.append(a)
+
+    skipped = len(alerts) - len(result)
     if skipped:
-        logger.info(f"Skipping {skipped} already-sent alert(s) (use --force to resend)")
-    return new
+        logger.info(f"Skipped {skipped} already-sent alert(s)")
+    return result
 
 
 def record_sent(alerts: list[dict], scan_ts: str, channels: list[str]) -> None:
@@ -206,7 +235,9 @@ def format_telegram_summary(
 
 def _load_budget_for_display(config: dict) -> dict:
     """Load budget info for inclusion in digest emails."""
-    weekly_max  = config.get("budget", {}).get("weekly_trade_max", 5)
+    weekly_max  = config.get("budget", {}).get("weekly_trade_max")
+    if weekly_max is not None and int(weekly_max) <= 0:
+        weekly_max = None
     total_usd   = config.get("budget", {}).get("total_usd", 500)
     per_trade   = round(total_usd / weekly_max) if weekly_max else total_usd
     used        = 0
@@ -218,7 +249,7 @@ def _load_budget_for_display(config: dict) -> dict:
             with open(BUDGET_PATH) as f:
                 b = json.load(f)
             used      = b.get("surfaced_this_week", 0)
-            remaining = max(0, weekly_max - used)
+            remaining = max(0, weekly_max - used) if weekly_max else None
             week_start = b.get("week_start", week_start)
         except Exception:
             pass
@@ -235,16 +266,25 @@ def _load_budget_for_display(config: dict) -> dict:
 
 def _alert_card_html(a: dict) -> str:
     """Render a single alert as an HTML card."""
+    is_exit = a.get("alert_action") == "exit"
     direction = a["direction"].upper()
-    dir_color = "#1a7f37" if direction == "CALL" else "#cf222e"
-    dir_bg    = "#dafbe1" if direction == "CALL" else "#ffebe9"
+    if is_exit:
+        dir_color = "#9a6700"
+        dir_bg = "#fff8c5"
+        header = f"🛑 EXIT {a['symbol']} — SELL {direction}"
+    else:
+        dir_color = "#1a7f37" if direction == "CALL" else "#cf222e"
+        dir_bg = "#dafbe1" if direction == "CALL" else "#ffebe9"
+        header = f"{a['symbol']} — {direction}"
     score_pct = int(a["score"] * 100)
     risk      = a.get("risk_level", "?")
     dte       = a.get("suggested_dte") or "see rationale"
     creators  = " ".join(f"@{c}" for c in a.get("supporting_creators", [])) or "heuristic"
     signals   = "".join(f"<li>{s}</li>" for s in a.get("key_signals", [])[:5])
     rationale = a.get("rationale", "")
-    method    = "LLM" if a.get("scoring_method") == "llm" else "Heuristic"
+    method    = {"llm": "LLM", "intraday_rules": "0DTE Rules"}.get(
+        a.get("scoring_method"), "Heuristic"
+    )
     size_hint = a.get("position_size_hint", "")
 
     entry_note  = a.get("entry_note", "")
@@ -281,18 +321,33 @@ def _alert_card_html(a: dict) -> str:
           {rows}
         </table>"""
 
+    exit_meta = ""
+    if is_exit:
+        entry_px = a.get("entry_underlying_price")
+        now_px = a.get("underlying_price")
+        move = a.get("underlying_move_pct")
+        if entry_px and now_px is not None:
+            exit_meta = (
+                f'<div style="margin:8px 0; font-size:13px; color:#9a6700;">'
+                f'Entry ${entry_px} → Now ${now_px}'
+                f'{f" ({move:+.2f}% und move)" if move is not None else ""}'
+                f'</div>'
+            )
+    score_label = "Reversal" if is_exit else "Score"
+
     return f"""
     <div style="border:1px solid #d0d7de; border-radius:8px; padding:16px;
                 margin-bottom:16px; font-family:system-ui,sans-serif;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:22px; font-weight:700;">{a['symbol']}</span>
+        <span style="font-size:22px; font-weight:700;">{header}</span>
         <span style="background:{dir_bg}; color:{dir_color}; font-weight:700;
                      padding:4px 12px; border-radius:12px; font-size:14px;">
-          {direction}
+          {"SELL" if is_exit else direction}
         </span>
       </div>
+      {exit_meta}
       <div style="margin:8px 0; color:#57606a; font-size:14px;">
-        Score: <b>{score_pct}%</b> &nbsp;│&nbsp; Risk: <b>{risk}</b>
+        {score_label}: <b>{score_pct}%</b> &nbsp;│&nbsp; Risk: <b>{risk}</b>
         &nbsp;│&nbsp; DTE: <b>{dte}</b> &nbsp;│&nbsp; Scoring: {method}
       </div>
       <div style="margin:8px 0; font-size:13px; color:#57606a;">
@@ -313,7 +368,13 @@ def _contract_html(a: dict) -> str:
     """Render the 3-tier option contract block."""
     rc = a.get("recommended_contract")
     if not rc or not rc.get("tiers"):
-        return ""
+        note = (rc or {}).get("notes", "Option pricing not available yet — options market may not be fully open. Re-run the scan after 9:45 AM ET for live contract recommendations.")
+        return f"""
+    <div style="margin-top:12px; padding:10px 14px; border:1px solid #f0b429;
+                border-radius:8px; background:#fffbeb; font-size:12px; color:#854d0e;
+                font-family:system-ui,sans-serif;">
+      ⏳ <b>Option contracts not yet priced</b> — {note}
+    </div>"""
 
     sym     = a["symbol"]
     tiers   = rc["tiers"]
@@ -372,6 +433,17 @@ def _contract_html(a: dict) -> str:
 
 
 def _budget_html(bud: dict) -> str:
+    if not bud.get("weekly_max"):
+        return f"""
+    <div style="border:1px solid #d0d7de; border-radius:8px; padding:12px 16px;
+                margin-bottom:16px; background:#f6f8fa; font-family:system-ui,sans-serif;">
+      <div style="font-size:13px; color:#57606a;">
+        Account budget: ${bud['total_usd']} total &nbsp;│&nbsp;
+        {bud['used']} alert(s) surfaced this week &nbsp;│&nbsp; week of {bud['week_start']}
+        &nbsp;│&nbsp; <span style="color:#57606a;">no weekly cap</span>
+      </div>
+    </div>
+    """
     bar_pct = int(bud["used"] / bud["weekly_max"] * 100) if bud["weekly_max"] else 0
     bar_color = "#2da44e" if bar_pct < 60 else ("#d29922" if bar_pct < 100 else "#cf222e")
     return f"""
@@ -415,8 +487,8 @@ def format_email_html(
             the current scoring threshold.
           </p>
           <p style="font-size:13px; color:#57606a; margin:0;">
-            Additional scans are scheduled at <b>12:00 PM</b> and <b>2:30 PM ET</b>.
-            You'll receive an email immediately if a trade signal appears.
+            Midday scan at <b>12:45 PM ET</b>.
+            You'll receive an email immediately if a trade signal appears (with call/put contracts to buy).
           </p>
         </div>
         """
@@ -458,28 +530,50 @@ def format_email_text(
     if morning_digest and not alerts:
         lines = [
             f"MORNING MARKET DIGEST — {scan_dt} UTC",
-            f"Week of {bud['week_start']} | Budget: {bud['used']}/{bud['weekly_max']} trades used",
+            f"Week of {bud['week_start']} | ${bud['total_usd']} account budget",
             "=" * 50,
             "",
             "No qualifying trade setups found at market open.",
-            "Additional scans scheduled at 12:00 PM and 2:30 PM ET.",
-            "You will receive an email immediately if a signal appears.",
+            "Midday scan at 12:45 PM ET.",
+            "You will receive an email with call/put contract options if a signal appears.",
         ]
+        if bud.get("weekly_max"):
+            lines[1] += f" | {bud['used']}/{bud['weekly_max']} trades used"
+        else:
+            lines[1] += f" | {bud['used']} alert(s) this week (no weekly cap)"
         return "\n".join(lines)
 
     lines = [
         f"TRADE ALERTS — {scan_dt} UTC",
-        f"Week of {bud['week_start']} | Budget: {bud['used']}/{bud['weekly_max']} trades | ~${bud['per_trade']}/trade",
+        f"Week of {bud['week_start']} | ${bud['total_usd']} account budget",
     ]
+    if bud.get("weekly_max"):
+        lines[-1] += f" | {bud['used']}/{bud['weekly_max']} trades | ~${bud['per_trade']}/trade"
+    else:
+        lines[-1] += f" | {bud['used']} alert(s) this week (no weekly cap)"
     if context:
         lines.append(f"Context: {context}")
     lines.append("=" * 50)
     for a in alerts:
         size_hint = a.get("position_size_hint", "")
-        lines += [
-            f"\n{a['symbol']} — {a['direction'].upper()}",
-            f"Score: {int(a['score']*100)}%  Risk: {a.get('risk_level')}  DTE: {a.get('suggested_dte')}",
-        ]
+        is_exit = a.get("alert_action") == "exit"
+        if is_exit:
+            lines += [
+                f"\n🛑 EXIT — SELL {a['symbol']} {a['direction'].upper()}",
+                f"Reversal score: {int(a['score']*100)}%  Risk: {a.get('risk_level')}",
+            ]
+            if a.get("entry_underlying_price") is not None:
+                lines.append(
+                    f"Underlying: ${a['entry_underlying_price']} → "
+                    f"${a.get('underlying_price')} "
+                    f"({a.get('underlying_move_pct')}%)"
+                )
+        else:
+            lines += [
+                f"\n{a['symbol']} — {a['direction'].upper()}",
+                f"Score: {int(a['score']*100)}%  Risk: {a.get('risk_level')}  "
+                f"DTE: {a.get('suggested_dte')}",
+            ]
         if size_hint:
             lines.append(f"Size: {size_hint}")
         lines += [
@@ -507,6 +601,9 @@ def format_email_text(
                         f"1 contract=${t['cost_per_contract']:.0f} | mid=${t['mid_price']}/sh | "
                         f"{t['pct_otm']:+.1f}%OTM | IV={t['iv_pct']} | vol={t['volume']:,}"
                     )
+        elif rc:
+            note = rc.get("notes", "Option pricing not yet available — re-run scan after 9:45 AM ET.")
+            lines.append(f"--- Options: {note} ---")
     return "\n".join(lines)
 
 
@@ -573,6 +670,8 @@ def send_email(
     dry_run:        bool,
     config:         Optional[dict] = None,
     morning_digest: bool = False,
+    custom_subject: Optional[str] = None,
+    intraday:       bool = False,
 ) -> bool:
     """Send alert digest (or morning no-trade digest) via SMTP. Returns True on success."""
     smtp_host = em_cfg.get("smtp_host", "smtp.gmail.com")
@@ -586,8 +685,22 @@ def send_email(
         return False
 
     today_str = date.today().strftime("%a %b %-d")
-    if morning_digest and not alerts:
+    if custom_subject:
+        subject = custom_subject
+    elif morning_digest and not alerts:
         subject = f"📋 Morning Digest — No trades today ({today_str})"
+    elif intraday and alerts:
+        a = alerts[0]
+        if a.get("alert_action") == "exit":
+            subject = (
+                f"🛑 0DTE EXIT {a['symbol']} {a['direction'].upper()} — "
+                f"reversal {int(a['score'] * 100)}% ({today_str})"
+            )
+        else:
+            subject = (
+                f"⚡ 0DTE {a['symbol']} {a['direction'].upper()} — "
+                f"{int(a['score'] * 100)}% ({today_str})"
+            )
     else:
         n = len(alerts)
         subject = f"📊 {n} Trade Alert{'s' if n != 1 else ''} — {today_str}"
@@ -678,6 +791,273 @@ def print_no_alerts() -> None:
   • To run a fresh scan: trade-scan
   • To lower the score threshold: trade-scan-score --min-score 0.5
 """)
+
+
+# ─── Intraday 0DTE alerts ──────────────────────────────────────────────────────
+def load_intraday_sent_history() -> dict:
+    if not INTRADAY_SENT_PATH.exists():
+        return {}
+    try:
+        return json.loads(INTRADAY_SENT_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _intraday_fingerprint(alert: dict) -> str:
+    ts = alert.get("scan_timestamp", "")
+    action = alert.get("alert_action", "entry")
+    entry_ts = alert.get("exit_for_entry_ts", "")
+    if action == "exit" and entry_ts:
+        return f"exit:{alert['symbol']}:{alert['direction']}:{entry_ts[:16]}"
+    return f"{action}:{alert['symbol']}:{alert['direction']}:{ts[:16]}"
+
+
+def notify_intraday_alerts(
+    alerts: list[dict],
+    config: dict,
+    dry_run: bool = False,
+) -> int:
+    """
+    Send one email per new intraday 0DTE alert (real-time, minute-level dedup).
+    Returns count of emails sent.
+    """
+    if not alerts:
+        return 0
+
+    icfg = config.get("intraday_0dte", {})
+    if not icfg.get("email_alerts_enabled", True) and not dry_run:
+        logger.info(
+            f"Intraday email disabled in config — {len(alerts)} alert(s) skipped"
+        )
+        return 0
+
+    em_cfg = config.get("notifications", {}).get("email", {})
+    if not em_cfg.get("enabled", False) and not dry_run:
+        logger.warning("Email not enabled — intraday alerts logged only")
+        return 0
+
+    history = load_intraday_sent_history()
+    sent_count = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for alert in alerts:
+        fp = _intraday_fingerprint(alert)
+        if fp in history:
+            logger.info(f"Intraday email already sent: {fp}")
+            continue
+
+        alert = dict(alert)
+        alert.setdefault("scoring_method", "intraday_rules")
+        alert.setdefault("risk_level", "high")
+        scan_ts = alert.get("scan_timestamp", now)
+
+        ok = send_email(
+            [alert], scan_ts, "0–1 DTE intraday", em_cfg,
+            dry_run=dry_run, config=config, intraday=True,
+        )
+        if ok:
+            history[fp] = {
+                "symbol": alert["symbol"],
+                "direction": alert["direction"],
+                "alert_action": alert.get("alert_action", "entry"),
+                "score": alert.get("score"),
+                "sent_at": now,
+                "scan_timestamp": scan_ts,
+            }
+            sent_count += 1
+            action = alert.get("alert_action", "entry")
+            logger.info(
+                f"Intraday email sent: {action} {alert['symbol']} {alert['direction']}"
+            )
+
+    if sent_count and not dry_run:
+        INTRADAY_SENT_PATH.write_text(json.dumps(history, indent=2))
+
+    return sent_count
+
+
+def send_intraday_reflect_summary(
+    records: list[dict],
+    target_date: date,
+    config: dict,
+    dry_run: bool = False,
+) -> bool:
+    """Email end-of-day 0DTE performance summary after daily reflect."""
+    em_cfg = config.get("notifications", {}).get("email", {})
+    if not em_cfg.get("enabled", False) and not dry_run:
+        return False
+
+    if not records:
+        subject = f"📊 0DTE Daily Review — no alerts ({target_date.isoformat()})"
+        body_plain = f"No intraday 0DTE alerts were logged on {target_date.isoformat()}."
+        body_html = f"<p>{body_plain}</p>"
+    else:
+        wins = sum(1 for r in records if r.get("miss_type") == "correct_take")
+        subject = (
+            f"📊 0DTE Daily Review — {wins}/{len(records)} wins "
+            f"({target_date.strftime('%a %b %-d')})"
+        )
+        rows = []
+        for r in records:
+            icon = "✓" if r.get("miss_type") == "correct_take" else "✗"
+            pnl = r.get("outcome_option_pnl_pct", r.get("outcome_5d_pct"))
+            und = r.get("outcome_underlying_pct")
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            und_s = f"{und:+.2f}%" if und is not None else "n/a"
+            label = r.get("contract_label", "")
+            contract = f" [{label[:40]}]" if label else ""
+            if r.get("outcome_no_exit"):
+                exit_note = " — no exit alert (full loss)"
+            elif r.get("exit_timestamp"):
+                exit_note = f" — exit {r['exit_timestamp'][:16]}"
+            else:
+                exit_note = ""
+            rows.append(
+                f"{icon} {r.get('symbol')} {r.get('direction')} "
+                f"score={r.get('score')} → option {pnl_s} (underlying {und_s})"
+                f"{contract}{exit_note}"
+            )
+        body_plain = "\n".join(rows)
+        body_html = "<br>".join(rows)
+
+    smtp_host = em_cfg.get("smtp_host", "smtp.gmail.com")
+    smtp_port = int(em_cfg.get("smtp_port", 587))
+    smtp_user = em_cfg.get("smtp_user", "")
+    smtp_pass = em_cfg.get("smtp_password", "")
+    to_addr = em_cfg.get("to", smtp_user)
+
+    if not all([smtp_host, smtp_user, smtp_pass]):
+        return False
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = to_addr
+    msg.attach(MIMEText(body_plain, "plain"))
+    msg.attach(MIMEText(
+        f"<html><body style='font-family:system-ui'>{body_html}</body></html>", "html",
+    ))
+
+    if dry_run:
+        print(f"[DRY RUN] {subject}\n{body_plain}")
+        return True
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_addr, msg.as_string())
+        logger.info(f"Intraday reflect email sent: {subject}")
+        return True
+    except Exception as exc:
+        logger.error(f"Intraday reflect email failed: {exc}")
+        return False
+
+
+def _swing_row_suffix(r: dict) -> str:
+    """Interim/final label + contract for weekly swing email lines."""
+    parts: list[str] = []
+    if r.get("outcome_interim"):
+        parts.append(f"interim through {r.get('outcome_as_of', '?')}")
+        if r.get("option_target_exit_date"):
+            parts.append(f"final after {r['option_target_exit_date']}")
+    label = r.get("contract_label", "")
+    if label:
+        parts.append(label[:35])
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
+def send_weekly_swing_reflect_summary(
+    records: list[dict],
+    week_start: date,
+    config: dict,
+    dry_run: bool = False,
+    pending_alerts: list[dict] | None = None,
+) -> bool:
+    """Email weekly performance for swing-scan emailed alerts (7–14 DTE pipeline)."""
+    em_cfg = config.get("notifications", {}).get("email", {})
+    if not em_cfg.get("enabled", False) and not dry_run:
+        return False
+
+    week_end = week_start + timedelta(days=4)
+    label = f"{week_start.strftime('%b %-d')}–{week_end.strftime('%b %-d')}"
+    hold_days = int(config.get("swing_reflect", {}).get("hold_days", 5))
+    pending = pending_alerts or []
+
+    if not records and not pending:
+        subject = f"📊 Weekly Swing Review — no alerts ({label})"
+        body_plain = f"No swing-scan alerts were emailed during the week of {week_start.isoformat()}."
+        body_html = f"<p>{body_plain}</p>"
+    elif not records and pending:
+        subject = f"📊 Weekly Swing Review — {len(pending)} unpriced ({label})"
+        rows = [
+            f"— {a['sent_date']} {a['symbol']} {a['direction']} score={a.get('score')} "
+            f"(no option contract in archive)"
+            for a in pending
+        ]
+        body_plain = "\n".join(rows)
+        body_html = "<br>".join(rows)
+    else:
+        wins = sum(1 for r in records if r.get("miss_type") == "correct_take")
+        interim_n = sum(1 for r in records if r.get("outcome_interim"))
+        interim_tag = " interim" if interim_n else ""
+        subject = f"📊 Weekly Swing Review — {wins}/{len(records)} wins{interim_tag} ({label})"
+        rows = []
+        for r in sorted(records, key=lambda x: x.get("scan_date", "")):
+            icon = "✓" if r.get("miss_type") == "correct_take" else "✗"
+            pnl = r.get("outcome_option_pnl_pct", r.get("outcome_5d_pct"))
+            und = r.get("outcome_underlying_pct")
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            und_s = f"{und:+.1f}%" if und is not None else "n/a"
+            rows.append(
+                f"{icon} {r.get('scan_date','?')} {r.get('symbol')} {r.get('direction')} "
+                f"score={r.get('score')} → option {pnl_s} (underlying {und_s})"
+                f"{_swing_row_suffix(r)}"
+            )
+        if pending:
+            rows.append("")
+            rows.append("Unpriced (no contract in archive):")
+            for a in pending:
+                rows.append(
+                    f"— {a['sent_date']} {a['symbol']} {a['direction']} score={a.get('score')}"
+                )
+        body_plain = "\n".join(rows)
+        body_html = "<br>".join(rows)
+
+    smtp_host = em_cfg.get("smtp_host", "smtp.gmail.com")
+    smtp_port = int(em_cfg.get("smtp_port", 587))
+    smtp_user = em_cfg.get("smtp_user", "")
+    smtp_pass = em_cfg.get("smtp_password", "")
+    to_addr = em_cfg.get("to", smtp_user)
+
+    if not all([smtp_host, smtp_user, smtp_pass]):
+        return False
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = to_addr
+    msg.attach(MIMEText(body_plain, "plain"))
+    msg.attach(MIMEText(
+        f"<html><body style='font-family:system-ui'>{body_html}</body></html>", "html",
+    ))
+
+    if dry_run:
+        print(f"[DRY RUN] {subject}\n{body_plain}")
+        return True
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_addr, msg.as_string())
+        logger.info(f"Weekly swing reflect email sent: {subject}")
+        return True
+    except Exception as exc:
+        logger.error(f"Weekly swing reflect email failed: {exc}")
+        return False
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────

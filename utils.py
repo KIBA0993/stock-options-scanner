@@ -10,14 +10,28 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
-BASE_DIR    = Path.home() / "trading"
-DATA_DIR    = BASE_DIR / "data"
-BUDGET_PATH = DATA_DIR / "budget.json"
+BASE_DIR     = Path.home() / "trading"
+DATA_DIR     = BASE_DIR / "data"
+ARCHIVE_DIR  = DATA_DIR / "archive"
+BUDGET_PATH  = DATA_DIR / "budget.json"
+SENT_PATH    = DATA_DIR / "sent_history.json"
 
-WEEKLY_BUDGET = 10   # max alerts to surface per week
+WEEKLY_BUDGET = 10   # legacy default when config omits weekly_trade_max (unused if cap disabled)
+
+
+def get_weekly_trade_cap(config: dict | None = None) -> int | None:
+    """Max alerts per week from config.json. None = unlimited (cap disabled)."""
+    if not config:
+        return None
+    cap = config.get("budget", {}).get("weekly_trade_max")
+    if cap is None:
+        return None
+    cap = int(cap)
+    return cap if cap > 0 else None
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +109,141 @@ def rel_vol_bucket(rel_vol: float | None) -> str:
     if rel_vol < 4:
         return "elevated"
     return "extreme"
+
+
+def load_sent_history() -> dict:
+    """Load notify.py deduplication log (symbol alerts actually emailed)."""
+    if not SENT_PATH.exists():
+        return {}
+    try:
+        return json.loads(SENT_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def load_week_sent_alerts(week_start: date) -> list[dict]:
+    """
+    Unique emailed alerts for the ISO week containing week_start (Mon–Sun).
+    Dedupes by (symbol, direction), keeping the earliest send time.
+    """
+    week_end = week_start + timedelta(days=6)
+    deduped: dict[tuple[str, str], dict] = {}
+
+    for _key, rec in load_sent_history().items():
+        sent_at = datetime.fromisoformat(rec["sent_at"].replace("Z", "+00:00"))
+        sent_date = sent_at.date()
+        if not (week_start <= sent_date <= week_end):
+            continue
+        sym = rec["symbol"].upper()
+        direction = rec["direction"].lower()
+        slot = (sym, direction)
+        if slot not in deduped or sent_at < deduped[slot]["sent_at"]:
+            deduped[slot] = {
+                "symbol":    sym,
+                "direction": direction,
+                "score":     rec.get("score"),
+                "sent_at":   sent_at,
+                "sent_date": sent_date,
+            }
+
+    return sorted(deduped.values(), key=lambda r: r["sent_at"])
+
+
+def find_archive_alert(
+    week_start: date,
+    symbol: str,
+    direction: str,
+) -> Optional[dict]:
+    """Best-scoring archived call/put alert for symbol in the given week."""
+    if not ARCHIVE_DIR.exists():
+        return None
+
+    week_end = week_start + timedelta(days=6)
+    symbol = symbol.upper()
+    direction = direction.lower()
+    best: Optional[dict] = None
+    best_score = -1.0
+
+    for f in ARCHIVE_DIR.glob("scored-*.json"):
+        try:
+            date_str = f.stem.split("-")[1]
+            file_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
+        except (IndexError, ValueError):
+            continue
+        if not (week_start <= file_date <= week_end):
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        scan_ts = data.get("scan_timestamp", "")
+        for rec in data.get("all_scored", []):
+            if (rec.get("symbol") or "").upper() != symbol:
+                continue
+            if rec.get("direction", "").lower() != direction:
+                continue
+            score = float(rec.get("score") or 0)
+            if score > best_score:
+                best_score = score
+                best = dict(rec)
+                best["_scan_date"] = scan_ts
+
+    return best
+
+
+def _archive_has_contract(rec: dict) -> bool:
+    rc = rec.get("recommended_contract") or {}
+    tiers = rc.get("tiers") or {}
+    for key in ("atm", "slight_otm", "affordable"):
+        tier = tiers.get(key)
+        if tier and float(tier.get("mid_price") or 0) > 0:
+            return True
+    return False
+
+
+def find_archive_alert_on_date(
+    symbol: str,
+    direction: str,
+    alert_date: date,
+) -> Optional[dict]:
+    """Best alert for symbol+direction from scored archives on a specific day."""
+    if not ARCHIVE_DIR.exists():
+        return None
+
+    symbol = symbol.upper()
+    direction = direction.lower()
+    prefix = f"scored-{alert_date.strftime('%Y%m%d')}-"
+    best_with_contract: Optional[dict] = None
+    best_with_contract_score = -1.0
+    best_any: Optional[dict] = None
+    best_any_score = -1.0
+
+    for f in sorted(ARCHIVE_DIR.glob(f"{prefix}*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        scan_ts = data.get("scan_timestamp", "")
+        candidates = list(data.get("alerts", [])) + list(data.get("all_scored", []))
+        for rec in candidates:
+            if (rec.get("symbol") or "").upper() != symbol:
+                continue
+            if rec.get("direction", "").lower() != direction:
+                continue
+            score = float(rec.get("score") or 0)
+            enriched = dict(rec)
+            enriched["_scan_date"] = scan_ts
+            if score > best_any_score:
+                best_any_score = score
+                best_any = enriched
+            if _archive_has_contract(rec) and score > best_with_contract_score:
+                best_with_contract_score = score
+                best_with_contract = enriched
+
+    if best_with_contract:
+        return best_with_contract
+    if best_any:
+        return best_any
+
+    week_start = alert_date - timedelta(days=alert_date.weekday())
+    return find_archive_alert(week_start, symbol, direction)

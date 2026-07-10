@@ -31,7 +31,31 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from utils import monday_of_week, rsi_bucket, momentum_bucket, rel_vol_bucket
+from utils import (
+    monday_of_week,
+    rsi_bucket,
+    momentum_bucket,
+    rel_vol_bucket,
+    load_week_sent_alerts,
+    find_archive_alert,
+    find_archive_alert_on_date,
+)
+
+try:
+    from intraday_0dte import (
+        find_exit_for_entry,
+        load_alerts_for_date,
+        load_entry_alerts_for_date,
+        load_week_intraday_alerts,
+    )
+    from option_outcome import evaluate_intraday_alert, evaluate_swing_alert
+except ImportError:
+    load_week_intraday_alerts = None  # type: ignore
+    load_entry_alerts_for_date = None  # type: ignore
+    load_alerts_for_date = None  # type: ignore
+    find_exit_for_entry = None  # type: ignore
+    evaluate_intraday_alert = None  # type: ignore
+    evaluate_swing_alert = None  # type: ignore
 
 BASE_DIR      = Path.home() / "trading"
 DATA_DIR      = BASE_DIR / "data"
@@ -85,6 +109,38 @@ def append_history(records: list[dict]) -> None:
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_PATH, "a") as f:
         for r in records:
+            f.write(json.dumps(r, default=str) + "\n")
+
+
+def upsert_sent_alert_records(records: list[dict]) -> None:
+    """Replace sent_alert rows for the same week/symbol/direction (interim refresh)."""
+    if not records:
+        return
+    keys = {
+        (r["week_start"], r["symbol"].upper(), r["direction"].lower())
+        for r in records
+        if r.get("source") == "sent_alert"
+    }
+    if not keys:
+        append_history(records)
+        return
+
+    history = load_history()
+    kept = [
+        r for r in history
+        if not (
+            r.get("source") == "sent_alert"
+            and (
+                r.get("week_start"),
+                (r.get("symbol") or "").upper(),
+                (r.get("direction") or "").lower(),
+            ) in keys
+        )
+    ]
+    kept.extend(records)
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_PATH, "w") as f:
+        for r in kept:
             f.write(json.dumps(r, default=str) + "\n")
 
 
@@ -212,6 +268,7 @@ def build_history_record(
     week_start: date,
     outcome_pct: Optional[float],
     miss_type: str,
+    source: str = "archive_skip",
 ) -> dict:
     """Convert a scored candidate into a reflect_history.jsonl record."""
     pat      = rec.get("patterns") or {}
@@ -242,6 +299,7 @@ def build_history_record(
         "outcome_5d_pct":       outcome_pct,
         "outcome_correct":      outcome_correct,
         "miss_type":            miss_type,
+        "source":               source,
         "amendment_rejected":   False,
     }
 
@@ -492,16 +550,110 @@ def reject_amendment(creator_handle: str, amendment_date: str, reason: str) -> N
 
 
 # ─── Weekly processing ──────────────────────────────────────────────────────────
-def process_week(week_start: date, force: bool = False) -> list[dict]:
-    """
-    Load archives for the given week, compute outcomes, return new history records.
-    Idempotent: if records for this week_start already exist, skips unless force=True.
-    """
-    history = load_history()
+def _week_has_archive_records(history: list[dict], week_start: date) -> bool:
+    """True if archive skip/journal records already exist for this week."""
+    ws = week_start.isoformat()
+    return any(
+        r.get("week_start") == ws and r.get("source", "archive_skip") != "sent_alert"
+        for r in history
+    )
 
-    existing_weeks = {r.get("week_start") for r in history}
-    if week_start.isoformat() in existing_weeks and not force:
-        logger.info(f"Week {week_start} already processed — skipping (use --force to reprocess)")
+
+def _sent_alert_processed(
+    history: list[dict], week_start: date, symbol: str, direction: str,
+) -> bool:
+    """True when a final (full-hold) score is already stored."""
+    ws = week_start.isoformat()
+    for r in history:
+        if (
+            r.get("week_start") == ws
+            and r.get("source") == "sent_alert"
+            and r.get("symbol", "").upper() == symbol.upper()
+            and r.get("direction", "").lower() == direction.lower()
+        ):
+            if r.get("outcome_final"):
+                return True
+            if r.get("outcome_final") is None and r.get("outcome_option_pnl_pct") is not None:
+                # Legacy rows before outcome_final existed — treat as final
+                return True
+    return False
+
+
+def _direction_correct(direction: str, outcome_pct: float) -> bool:
+    if direction == "call":
+        return outcome_pct > 0
+    return outcome_pct < 0
+
+
+def process_sent_alerts(
+    week_start: date, force: bool = False, config: dict | None = None,
+) -> list[dict]:
+    """
+    Evaluate emailed swing alerts from sent_history.json.
+    Scores option P&L mark-to-market through the latest session; refreshes
+    interim scores until the full hold window completes.
+    """
+    if evaluate_swing_alert is None:
+        logger.warning("option_outcome not available — skipping sent alerts")
+        return []
+
+    history = load_history()
+    sent = load_week_sent_alerts(week_start)
+    if not sent:
+        logger.info(f"No sent alerts for week {week_start}")
+        return []
+
+    new_records: list[dict] = []
+    for alert in sent:
+        symbol    = alert["symbol"]
+        direction = alert["direction"]
+        if not force and _sent_alert_processed(history, week_start, symbol, direction):
+            continue
+
+        archive = find_archive_alert_on_date(symbol, direction, alert["sent_date"]) or {
+            "symbol":               symbol,
+            "direction":            direction,
+            "score":                alert.get("score"),
+            "rationale":            "Emailed alert (no matching archive record)",
+            "supporting_creators":  [],
+            "would_have_direction": direction,
+            "_scan_date":           alert["sent_at"].isoformat(),
+        }
+
+        time.sleep(0.1)
+        scored = evaluate_swing_alert(archive, alert["sent_date"], config)
+
+        if scored.get("outcome_option_pnl_pct") is None:
+            logger.info(f"No option price for {symbol} {direction} — skip")
+            continue
+
+        if scored.get("outcome_interim"):
+            logger.info(
+                f"Interim swing score for {symbol} {direction}: "
+                f"{scored.get('outcome_option_pnl_pct'):+.1f}% "
+                f"(through {scored.get('outcome_as_of')})"
+            )
+
+        rec = build_history_record(
+            archive, week_start,
+            scored.get("outcome_5d_pct"),
+            scored["miss_type"],
+            source="sent_alert",
+        )
+        rec = _apply_option_outcome(rec, scored)
+        rec["scan_date"] = alert["sent_date"].isoformat()
+        new_records.append(rec)
+
+    return new_records
+
+
+def process_archive_week(week_start: date, force: bool = False) -> list[dict]:
+    """Load archived scan candidates (skips + journaled takes) for the week."""
+    history = load_history()
+    if _week_has_archive_records(history, week_start) and not force:
+        logger.info(
+            f"Archive week {week_start} already processed — skipping archive pass"
+        )
         return []
 
     candidates = load_week_archives(week_start)
@@ -524,7 +676,6 @@ def process_week(week_start: date, force: bool = False) -> list[dict]:
         scan_date = date.fromisoformat(scan_ts[:10]) if scan_ts else week_start
 
         if direction == "skip":
-            # Fetch outcome for skipped candidates not in journal
             outcome = None
             if symbol not in journal_symbols:
                 time.sleep(0.1)
@@ -539,22 +690,194 @@ def process_week(week_start: date, force: bool = False) -> list[dict]:
                 )
             )
             miss_type = "false_skip" if is_miss else "correct_skip"
-            new_records.append(build_history_record(rec, week_start, outcome, miss_type))
+            new_records.append(
+                build_history_record(rec, week_start, outcome, miss_type, "archive_skip")
+            )
 
         elif symbol in journal_symbols:
-            # Taken trade — outcome comes from journal
             je = next(
                 (e for e in journal
-                 if e["symbol"].upper() == symbol and e.get("entry_date", "")[:10] >= week_start.isoformat()),
+                 if e["symbol"].upper() == symbol
+                 and e.get("entry_date", "")[:10] >= week_start.isoformat()),
                 None,
             )
             if je:
                 outcome = je.get("underlying_move") or je.get("pnl_pct")
                 r_val   = je.get("pnl_r")
                 miss_type = "false_take" if (r_val is not None and r_val < 0) else "correct_take"
-                new_records.append(build_history_record(rec, week_start, outcome, miss_type))
+                new_records.append(
+                    build_history_record(rec, week_start, outcome, miss_type, "journal_take")
+                )
 
     return new_records
+
+
+def _intraday_alert_processed(
+    history: list[dict], week_start: date, scan_timestamp: str,
+) -> bool:
+    ws = week_start.isoformat()
+    return any(
+        r.get("week_start") == ws
+        and r.get("source") == "intraday_0dte"
+        and r.get("scan_timestamp") == scan_timestamp
+        for r in history
+    )
+
+
+def _apply_option_outcome(rec: dict, scored: dict) -> dict:
+    rec["miss_type"] = scored["miss_type"]
+    rec["outcome_5d_pct"] = scored.get("outcome_5d_pct")
+    rec["outcome_option_pnl_pct"] = scored.get("outcome_option_pnl_pct")
+    rec["outcome_underlying_pct"] = scored.get("outcome_underlying_pct")
+    rec["option_entry_mid"] = scored.get("option_entry_mid")
+    rec["option_exit_mid"] = scored.get("option_exit_mid")
+    rec["option_exit_date"] = scored.get("option_exit_date")
+    rec["option_target_exit_date"] = scored.get("option_target_exit_date")
+    rec["outcome_as_of"] = scored.get("outcome_as_of")
+    rec["contract_label"] = scored.get("contract_label")
+    rec["outcome_final"] = scored.get("outcome_final", False)
+    rec["outcome_interim"] = scored.get("outcome_interim", False)
+    rec["outcome_correct"] = scored.get("miss_type") == "correct_take"
+    return rec
+
+
+def _apply_intraday_outcome(rec: dict, scored: dict) -> dict:
+    return _apply_option_outcome(rec, scored)
+
+
+def process_intraday_for_date(
+    target: date, force: bool = False, config: dict | None = None,
+) -> list[dict]:
+    """
+    Process intraday 0DTE entry alerts for a single day.
+
+    P&L uses the matched exit alert when present; entries with no exit alert
+    are scored as full loss (no_exit_loss_pct, default -100%).
+    """
+    if load_entry_alerts_for_date is None or evaluate_intraday_alert is None:
+        logger.warning("intraday_0dte module not available — skipping")
+        return []
+
+    week_start = monday_of_week(target)
+    history = load_history()
+    day_alerts = load_alerts_for_date(target) if load_alerts_for_date else []
+    entries = load_entry_alerts_for_date(target)
+    if not entries:
+        logger.info(f"No intraday entry alerts on {target}")
+        return []
+
+    new_records: list[dict] = []
+    for entry in entries:
+        scan_ts = entry.get("scan_timestamp", "")
+        if not force and _intraday_alert_processed(history, week_start, scan_ts):
+            continue
+
+        exit_alert = (
+            find_exit_for_entry(entry, day_alerts)
+            if find_exit_for_entry else None
+        )
+        time.sleep(0.1)
+        scored = evaluate_intraday_alert(entry, config, exit_alert=exit_alert)
+
+        rec = build_history_record(
+            entry, week_start, scored.get("outcome_5d_pct"), scored["miss_type"],
+            source="intraday_0dte",
+        )
+        rec = _apply_intraday_outcome(rec, scored)
+        rec["scan_date"] = target.isoformat()
+        rec["scan_timestamp"] = scan_ts
+        rec["pipeline"] = "intraday_0dte"
+        rec["had_exit_alert"] = exit_alert is not None
+        rec["exit_timestamp"] = scored.get("exit_timestamp")
+        rec["outcome_no_exit"] = scored.get("outcome_no_exit", False)
+        new_records.append(rec)
+
+    return new_records
+
+
+def process_intraday_0dte_week(
+    week_start: date, force: bool = False, config: dict | None = None,
+) -> list[dict]:
+    """
+    Evaluate logged 0–1 DTE intraday entry alerts for the week.
+
+    Uses exit-alert pricing when matched; no exit → full loss.
+    """
+    if load_week_intraday_alerts is None or evaluate_intraday_alert is None:
+        logger.warning("intraday_0dte module not available — skipping intraday pass")
+        return []
+
+    history = load_history()
+    entries = load_week_intraday_alerts(week_start)
+    if not entries:
+        logger.info(f"No intraday 0DTE alerts for week {week_start}")
+        return []
+
+    new_records: list[dict] = []
+    for entry in entries:
+        scan_ts = entry.get("scan_timestamp", "")
+        if not force and _intraday_alert_processed(history, week_start, scan_ts):
+            continue
+
+        try:
+            alert_date = date.fromisoformat(scan_ts[:10])
+        except (ValueError, TypeError):
+            alert_date = week_start
+
+        day_alerts = load_alerts_for_date(alert_date) if load_alerts_for_date else []
+        exit_alert = (
+            find_exit_for_entry(entry, day_alerts)
+            if find_exit_for_entry else None
+        )
+
+        time.sleep(0.1)
+        scored = evaluate_intraday_alert(entry, config, exit_alert=exit_alert)
+
+        rec = build_history_record(
+            entry, week_start, scored.get("outcome_5d_pct"), scored["miss_type"],
+            source="intraday_0dte",
+        )
+        rec = _apply_intraday_outcome(rec, scored)
+        rec["scan_date"] = alert_date.isoformat()
+        rec["scan_timestamp"] = scan_ts
+        rec["pipeline"] = "intraday_0dte"
+        rec["had_exit_alert"] = exit_alert is not None
+        rec["exit_timestamp"] = scored.get("exit_timestamp")
+        rec["outcome_no_exit"] = scored.get("outcome_no_exit", False)
+        new_records.append(rec)
+
+    return new_records
+
+
+def _load_config() -> dict:
+    cfg_path = BASE_DIR / "config.json"
+    if cfg_path.exists():
+        try:
+            return json.loads(cfg_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _persist_week_records(records: list[dict]) -> None:
+    sent = [r for r in records if r.get("source") == "sent_alert"]
+    other = [r for r in records if r.get("source") != "sent_alert"]
+    if sent:
+        upsert_sent_alert_records(sent)
+    if other:
+        append_history(other)
+
+
+def process_week(week_start: date, force: bool = False, config: dict | None = None) -> list[dict]:
+    """
+    Process archive skips/takes, emailed alerts, and intraday 0DTE alerts.
+    Each sub-pass is idempotent unless force=True.
+    """
+    config = config or _load_config()
+    archive_records  = process_archive_week(week_start, force=force)
+    sent_records     = process_sent_alerts(week_start, force=force, config=config)
+    intraday_records = process_intraday_0dte_week(week_start, force=force, config=config)
+    return archive_records + sent_records + intraday_records
 
 
 # ─── CLI Commands ───────────────────────────────────────────────────────────────
@@ -574,6 +897,9 @@ def cmd_report(args: argparse.Namespace) -> None:
     wins   = [r for r in taken if r["miss_type"] == "correct_take"]
     f_skips = [r for r in skips if r["miss_type"] == "false_skip"]
     c_skips = [r for r in skips if r["miss_type"] == "correct_skip"]
+    sent_taken = [r for r in taken if r.get("source") == "sent_alert"]
+    journal_taken = [r for r in taken if r.get("source") == "journal_take"]
+    intraday_taken = [r for r in taken if r.get("source") == "intraday_0dte"]
 
     win_rate = len(wins) / len(taken) * 100 if taken else 0
     skip_acc = len(c_skips) / len(skips) * 100 if skips else 0
@@ -582,9 +908,46 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(f"  WEEKLY REFLECTION  │  week of {week_start}")
     print(f"{'═'*60}")
     print(f"  Trades taken : {len(taken):>3}   Win rate : {win_rate:.0f}%")
+    if sent_taken or journal_taken or intraday_taken:
+        print(
+            f"    emailed    : {len(sent_taken):>3}   journaled : {len(journal_taken):>3}"
+            f"   0DTE intraday : {len(intraday_taken):>3}"
+        )
     print(f"  Skips        : {len(skips):>3}   Skip accuracy : {skip_acc:.0f}%")
     print(f"  False skips  : {len(f_skips):>3}   (skips that would have been profitable)")
     print()
+
+    if sent_taken:
+        print("  Emailed swing alerts (option P&L; underlying in parens):")
+        for r in sorted(sent_taken, key=lambda x: x.get("scan_date", "")):
+            icon = "✓" if r["miss_type"] == "correct_take" else "✗"
+            pnl = r.get("outcome_option_pnl_pct", r.get("outcome_5d_pct"))
+            und = r.get("outcome_underlying_pct")
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            und_s = f"{und:+.1f}%" if und is not None else "n/a"
+            interim = ""
+            if r.get("outcome_interim"):
+                interim = f" [interim→{r.get('option_target_exit_date', '?')}]"
+            print(f"    {icon} {r['symbol']:<6} {r['direction']:<4}  option {pnl_s:>8}  "
+                  f"(underlying {und_s}){interim}  score={r.get('score')}")
+        print()
+
+    if intraday_taken:
+        print("  0–1 DTE intraday (exit-alert P&L; no exit = full loss):")
+        for r in sorted(intraday_taken, key=lambda x: x.get("scan_date", "")):
+            icon = "✓" if r["miss_type"] == "correct_take" else "✗"
+            pnl = r.get("outcome_option_pnl_pct", r.get("outcome_5d_pct"))
+            und = r.get("outcome_underlying_pct")
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            und_s = f"{und:+.2f}%" if und is not None else "n/a"
+            exit_note = ""
+            if r.get("outcome_no_exit"):
+                exit_note = "  [no exit alert — full loss]"
+            elif r.get("exit_timestamp"):
+                exit_note = f"  [exit {r['exit_timestamp'][:16]}]"
+            print(f"    {icon} {r['symbol']:<6} {r['direction']:<4}  option {pnl_s:>8}  "
+                  f"(underlying {und_s}){exit_note}  score={r.get('score')}")
+        print()
 
     # Per-creator breakdown
     creator_stats: dict[str, dict] = {}
@@ -699,6 +1062,124 @@ def cmd_reject(args: argparse.Namespace) -> None:
     reject_amendment(handle, adate, reason)
 
 
+def cmd_intraday_daily(args: argparse.Namespace) -> None:
+    """End-of-day 0DTE review: score today's alerts, append history, email summary."""
+    from market_calendar import is_trading_day
+
+    target = date.today()
+    if not is_trading_day(target) and not getattr(args, "force", False):
+        logger.info(f"NYSE closed on {target} — skipping intraday daily reflect")
+        return
+
+    logger.info(f"=== reflect --intraday-daily ({target}) ===")
+    config = _load_config()
+    new_records = process_intraday_for_date(
+        target, force=getattr(args, "force", False), config=config,
+    )
+    if new_records:
+        append_history(new_records)
+        logger.info(f"Appended {len(new_records)} intraday record(s)")
+
+    try:
+        from notify import send_intraday_reflect_summary
+        send_intraday_reflect_summary(new_records, target, config)
+    except Exception as exc:
+        logger.warning(f"Intraday reflect email failed: {exc}")
+
+    if new_records:
+        wins = sum(1 for r in new_records if r.get("miss_type") == "correct_take")
+        print(f"\n  0DTE daily review: {wins}/{len(new_records)} correct "
+              f"({target.isoformat()})\n")
+    else:
+        print(f"\n  0DTE daily review: no alerts to score ({target.isoformat()})\n")
+
+    logger.info("=== reflect --intraday-daily complete ===")
+
+
+def cmd_weekly(args: argparse.Namespace) -> None:
+    """Friday weekly review: score past week's swing emailed alerts + email summary."""
+    week_start = monday_of_week(date.today())
+    config = _load_config()
+
+    logger.info(f"=== reflect --weekly (week of {week_start}) ===")
+
+    new_records = process_week(week_start, force=getattr(args, "force", False), config=config)
+    if new_records:
+        _persist_week_records(new_records)
+        logger.info(f"Saved {len(new_records)} record(s) to reflect_history.jsonl")
+
+    history = load_history()
+    week_sent = [
+        r for r in history
+        if r.get("week_start") == week_start.isoformat()
+        and r.get("source") == "sent_alert"
+    ]
+    sent_raw = load_week_sent_alerts(week_start)
+    scored_keys = {(r["symbol"], r["direction"]) for r in week_sent}
+    pending_sent = [
+        a for a in sent_raw
+        if (a["symbol"], a["direction"]) not in scored_keys
+    ]
+
+    try:
+        from notify import send_weekly_swing_reflect_summary
+        send_weekly_swing_reflect_summary(
+            week_sent, week_start, config, pending_alerts=pending_sent,
+        )
+    except Exception as exc:
+        logger.warning(f"Weekly swing reflect email failed: {exc}")
+
+    if week_sent:
+        wins = sum(1 for r in week_sent if r.get("miss_type") == "correct_take")
+        interim_n = sum(1 for r in week_sent if r.get("outcome_interim"))
+        interim_tag = f", {interim_n} interim" if interim_n else ""
+        print(f"\n  Weekly swing review: {wins}/{len(week_sent)} wins "
+              f"(week of {week_start}{interim_tag})\n")
+        for r in sorted(week_sent, key=lambda x: x.get("scan_date", "")):
+            icon = "✓" if r.get("miss_type") == "correct_take" else "✗"
+            pnl = r.get("outcome_option_pnl_pct", r.get("outcome_5d_pct"))
+            und = r.get("outcome_underlying_pct")
+            pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            und_s = f"{und:+.1f}%" if und is not None else "n/a"
+            interim = ""
+            if r.get("outcome_interim"):
+                interim = f" [interim through {r.get('outcome_as_of', '?')}]"
+            print(f"    {icon} {r.get('scan_date','?')} {r.get('symbol','?'):<6} "
+                  f"{r.get('direction','?'):<4}  option {pnl_s:>8}  (underlying {und_s})"
+                  f"{interim}  score={r.get('score')}")
+        print()
+    elif pending_sent:
+        print(f"\n  Weekly swing review: {len(pending_sent)} alert(s) could not be priced "
+              f"(week of {week_start})\n")
+        for a in pending_sent:
+            print(f"    ⏳ {a['sent_date']} {a['symbol']:<6} {a['direction']:<4}  "
+                  f"score={a.get('score')}")
+        print()
+    else:
+        print(f"\n  Weekly swing review: no emailed alerts (week of {week_start})\n")
+
+    # Pattern detection for swing pipeline (same as --auto)
+    history = load_history()
+    patterns = detect_patterns(history)
+    for p in patterns:
+        creator = p["signature"].get("creator", "")
+        if not creator or creator == "unknown":
+            continue
+        existing = load_amendments(creator)
+        already = any(a["date"] == date.today().isoformat() for a in existing)
+        if already:
+            continue
+        content = generate_amendment(creator, p)
+        path = write_amendment(creator, content)
+        print(f"  📝 Amendment draft written: {path}")
+
+    deleted = cleanup_old_archives()
+    if deleted:
+        print(f"  🗑  Cleaned up {deleted} old archive file(s)")
+
+    logger.info("=== reflect --weekly complete ===")
+
+
 def cmd_auto(args: argparse.Namespace) -> None:
     """
     Non-interactive full run for launchd.
@@ -706,12 +1187,13 @@ def cmd_auto(args: argparse.Namespace) -> None:
     Idempotent — safe to re-run.
     """
     week_start = monday_of_week(date.today())
+    config = _load_config()
     logger.info(f"=== reflect --auto starting (week {week_start}) ===")
 
-    new_records = process_week(week_start, force=getattr(args, "force", False))
+    new_records = process_week(week_start, force=getattr(args, "force", False), config=config)
     if new_records:
-        append_history(new_records)
-        logger.info(f"Appended {len(new_records)} records to reflect_history.jsonl")
+        _persist_week_records(new_records)
+        logger.info(f"Saved {len(new_records)} records to reflect_history.jsonl")
     else:
         logger.info("No new records to append (already processed or no archives)")
 
@@ -751,6 +1233,10 @@ def main() -> None:
     )
     parser.add_argument("--auto",  action="store_true",
                         help="Non-interactive full run (for launchd)")
+    parser.add_argument("--intraday-daily", action="store_true",
+                        help="End-of-day 0DTE alert review + email summary (trading days)")
+    parser.add_argument("--weekly", action="store_true",
+                        help="Weekly swing alert review + email summary (Fridays on NAS)")
     parser.add_argument("--force", action="store_true",
                         help="Reprocess current week even if already done")
 
@@ -771,7 +1257,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.auto or args.command is None:
+    if args.intraday_daily:
+        cmd_intraday_daily(args)
+    elif args.weekly:
+        cmd_weekly(args)
+    elif args.auto or args.command is None:
         cmd_auto(args)
     elif args.command == "report":
         cmd_report(args)

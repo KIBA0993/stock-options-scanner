@@ -87,11 +87,14 @@ def earnings_alert() -> dict:
 
 # ─── _fingerprint ──────────────────────────────────────────────────────────────
 class TestFingerprint:
-    def test_includes_symbol_direction_and_timestamp(self, call_alert: dict) -> None:
+    def test_includes_symbol_direction_and_date(self, call_alert: dict) -> None:
         fp = _fingerprint(call_alert, SCAN_TS)
         assert "NVDA" in fp
         assert "call" in fp
-        assert SCAN_TS in fp
+        # Fingerprint is intentionally date-only (not the full timestamp) so the
+        # same setup is not re-sent on every 10-minute scan throughout the day.
+        assert SCAN_TS[:10] in fp
+        assert SCAN_TS not in fp
 
     def test_different_directions_produce_different_fingerprints(
         self, call_alert: dict, put_alert: dict

@@ -73,9 +73,11 @@ def fetch_via_api(handle: str, limit: int, bearer_token: str) -> list[str]:
     posts: list[str] = []
     url = f"https://api.twitter.com/2/users/{user_id}/tweets"
     params = {
-        "max_results": min(100, limit),
-        "tweet.fields": "created_at,text,public_metrics",
-        "exclude": "retweets",
+        "max_results":  min(100, limit),
+        "tweet.fields": "created_at,text,public_metrics,attachments",
+        "expansions":   "attachments.media_keys",
+        "media.fields": "media_key,type,url,preview_image_url",
+        "exclude":      "retweets",
     }
     next_token = None
 
@@ -93,13 +95,31 @@ def fetch_via_api(handle: str, limit: int, bearer_token: str) -> list[str]:
             break
 
         data = resp.json()
+
+        # Build media_key → URL map from the includes block
+        media_map: dict[str, str] = {}
+        for m in data.get("includes", {}).get("media", []):
+            key = m.get("media_key", "")
+            # Photos have 'url'; videos/gifs have 'preview_image_url'
+            img_url = m.get("url") or m.get("preview_image_url", "")
+            if key and img_url and m.get("type") == "photo":
+                media_map[key] = img_url
+
         for tweet in data.get("data", []):
-            text = tweet.get("text", "").strip()
-            date = tweet.get("created_at", "")[:10]
+            text    = tweet.get("text", "").strip()
+            date    = tweet.get("created_at", "")[:10]
             metrics = tweet.get("public_metrics", {})
             likes   = metrics.get("like_count", 0)
             rt      = metrics.get("retweet_count", 0)
-            posts.append(f"[{date}] (likes:{likes} rt:{rt}) {text}")
+
+            # Collect image URLs attached to this tweet
+            media_keys = tweet.get("attachments", {}).get("media_keys", [])
+            image_urls = [media_map[k] for k in media_keys if k in media_map]
+
+            line = f"[{date}] (likes:{likes} rt:{rt}) {text}"
+            if image_urls:
+                line += f"\n[IMAGES: {', '.join(image_urls)}]"
+            posts.append(line)
 
         next_token = data.get("meta", {}).get("next_token")
         if not next_token:
@@ -107,7 +127,8 @@ def fetch_via_api(handle: str, limit: int, bearer_token: str) -> list[str]:
 
         time.sleep(1)  # be polite to the API
 
-    logger.info(f"Fetched {len(posts)} posts for @{handle}")
+    images_found = sum(1 for p in posts if "[IMAGES:" in p)
+    logger.info(f"Fetched {len(posts)} posts for @{handle} ({images_found} with chart images)")
     return posts
 
 

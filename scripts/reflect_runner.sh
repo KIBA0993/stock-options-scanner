@@ -1,15 +1,5 @@
 #!/bin/bash
-# reflect_runner.sh — launchd wrapper for the weekly self-reflection loop
-#
-# Called by: ~/Library/LaunchAgents/com.trading.reflect.plist
-# Schedule:  Every Friday at 5:05 PM local time (after market close)
-#
-# Logs go to: ~/trading/logs/reflect.log
-# Adjust Hour in the plist if your Mac is not in ET (UTC-4/UTC-5):
-#   PT  → Hour: 14
-#   CT  → Hour: 15
-#   MT  → Hour: 16
-#   ET  → Hour: 17
+# reflect_runner.sh — LOCAL DEV ONLY (production weekly review on NAS, Fri 5:15 PM ET).
 
 set -euo pipefail
 
@@ -27,6 +17,10 @@ mkdir -p "$TRADING_DIR/logs"
 echo "--- reflect_runner.sh started $(date '+%Y-%m-%d %H:%M:%S') ---" >> "$LOG_FILE"
 
 cd "$TRADING_DIR"
+source "$TRADING_DIR/scripts/trading_day_guard.sh" >> "$LOG_FILE" 2>&1 || {
+  echo "NYSE closed today — skipping reflect (Mac)" >> "$LOG_FILE"
+  exit 0
+}
 "$PYTHON" reflect.py --auto >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 

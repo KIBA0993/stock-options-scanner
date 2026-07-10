@@ -3,8 +3,8 @@
 #
 # Install: pip install -r requirements.txt
 
-# Market data — volume scanning, TA, news (direct Python import, no MCP server needed)
-tradingview-mcp-server>=0.7.0
+# Market data — volume scanning, TA (scanner.py uses tradingview-screener directly)
+tradingview-screener>=3.2.0
 
 # Options chains + earnings proximity
 yfinance>=0.2.40
@@ -12,8 +12,10 @@ yfinance>=0.2.40
 # Data manipulation
 pandas>=2.0.0
 
-# LLM (Week 3 — orchestrate.py)
+# LLM (orchestrate.py, distill.py, vertex_llm.py)
 anthropic>=0.25.0
+openai>=1.30.0
+google-auth>=2.29.0
 
 # HTTP
 requests>=2.31.0

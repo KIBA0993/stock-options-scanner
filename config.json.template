@@ -1,22 +1,18 @@
 {
   "budget": {
     "total_usd": 500,
-    "weekly_trade_max": 5
-  },
-  "scan": {
-    "min_price": 10.0,
-    "min_total_volume": 500000,
-    "earnings_buffer_hours": 48,
-    "pre_filter_top_n": 15,
-    "min_score": 0.60,
-    "max_daily_candidates": 2
+    "weekly_trade_max": null
   },
   "llm": {
-    "provider": "mammouth",
-    "model": "claude-sonnet-4-6",
-    "api_key": "YOUR_MAMMOUTH_OR_ANTHROPIC_API_KEY",
-    "ollama_model": "qwen2.5:14b",
-    "max_tokens": 4096
+    "provider": "vertex",
+    "model": "gemini-2.5-flash",
+    "project_id": "stock-500202",
+    "location": "us-central1",
+    "auth_mode": "adc",
+    "credentials_path": "secrets/gcp-adc.json",
+    "max_tokens": 8192,
+    "batch_size": 4,
+    "comment": "Vertex Gemini — uses GCP billing credit. ADC auth (no SA JSON key)."
   },
   "notifications": {
     "telegram": {
@@ -55,5 +51,32 @@
       "affordable":  35,
       "comment": "Max bid/ask spread as % of mid. Wide spreads mean poor fills on a small account."
     }
+  },
+  "intraday_0dte": {
+    "symbols": ["SPY", "QQQ", "IWM"],
+    "dte_max": 1,
+    "min_score": 0.70,
+    "max_alerts_per_run": 2,
+    "dedup_minutes": 30,
+    "or_minutes": 15,
+    "or_wait_minutes": 15,
+    "min_relative_volume": 1.0,
+    "min_option_pnl_pct": 0,
+    "exit_alerts_enabled": true,
+    "exit_min_score": 0.65,
+    "exit_dedup_minutes": 15,
+    "exit_min_hold_minutes": 5,
+    "max_exit_alerts_per_run": 2,
+    "no_exit_loss_pct": -100,
+    "comment": "Daily reflect: exit-alert P&L if sold; no exit alert = full loss (no_exit_loss_pct)."
+  },
+  "swing_reflect": {
+    "hold_days": 5,
+    "min_option_pnl_pct": 0,
+    "comment": "Win = option P&L > min_option_pnl_pct. Interim MTM through latest session until hold_days complete."
+  },
+  "validation": {
+    "horizons_days": [1, 3, 5],
+    "comment": "validate.py forward-test horizons (trading days). Run `python validate.py run` daily."
   }
 }

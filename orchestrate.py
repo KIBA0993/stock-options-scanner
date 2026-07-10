@@ -4,7 +4,8 @@ orchestrate.py — Trading Signal Orchestrator (Week 3 + 5)
 
 Reads scanner output (all_data.json), loads creator frameworks, scores each
 candidate with an LLM (or heuristic fallback), and writes trade alerts.
-Enforces weekly trade budget (max 10/week) via data/budget.json.
+Enforces optional weekly trade budget via config.json (budget.weekly_trade_max;
+set null or 0 to disable) and data/budget.json.
 
 Pipeline:
   scanner.py → data/all_data.json → orchestrate.py → data/alerts.json → notify.py
@@ -14,7 +15,7 @@ Usage:
   python orchestrate.py --no-llm             # force heuristic scoring
   python orchestrate.py --min-score 0.5      # lower threshold
   python orchestrate.py --dry-run            # score and print but don't write alerts.json
-  python orchestrate.py --ignore-budget      # bypass weekly 10-trade cap
+  python orchestrate.py --ignore-budget      # bypass weekly cap (when enabled in config)
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from typing import Optional
 from utils import (  # noqa: E402
     load_budget as _load_budget_util,
     save_budget as _save_budget_util,
+    get_weekly_trade_cap,
     monday_of_week,
 )
 
@@ -41,8 +43,6 @@ LOG_DIR      = BASE_DIR / "logs"
 CONFIG_PATH  = BASE_DIR / "config.json"
 CREATORS_DIR = BASE_DIR / "creators"
 BUDGET_PATH  = DATA_DIR / "budget.json"
-
-WEEKLY_BUDGET = 10   # max alerts to surface per week
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,9 +77,12 @@ def load_budget() -> dict:
     return budget
 
 
-def save_budget(budget: dict, new_count: int) -> None:
+def save_budget(budget: dict, new_count: int, weekly_cap: int | None = None) -> None:
     _save_budget_util(budget, new_count)
-    logger.info(f"Budget updated: {new_count}/{WEEKLY_BUDGET} this week")
+    if weekly_cap is not None:
+        logger.info(f"Budget updated: {new_count}/{weekly_cap} this week")
+    else:
+        logger.info(f"Budget updated: {new_count} alerts surfaced this week (no cap)")
 
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -282,7 +285,7 @@ Evaluate each candidate. Return ONLY this exact JSON:
       "symbol": "TICKER",
       "score": 0.75,
       "direction": "call",
-      "rationale": "2-3 sentences on why this setup matches a creator's framework",
+      "rationale": "2-3 sentences on why this setup matches one or more creator frameworks",
       "supporting_creators": ["kpak82"],
       "key_signals": ["RSI 81 overbought", "bearish EMA stack", "heavy put flow 0.4x"],
       "suggested_dte": "7-14 days",
@@ -308,10 +311,15 @@ RULES:
    Examples: "0-2 days", "7-14 days", "14-30 days", "30+ days"
 4. If direction = "skip" → set score ≤ 0.39, fill skip_reason, entry/stop/target may be null
 5. Check Red Flags for each creator — any match reduces score to ≤ 0.4
-6. kpak82 trades REVERSALS at extremes, NOT momentum chasing
-7. MasterPandaWu requires macro turning windows — only apply to broad market setups
-8. puppy_trades: use only for sector rotation themes (solar/nuclear/biotech/AI/space)
-9. CryptoKaleo: only generic TA principles (bull flag, HTF support) — never crypto signals
+6. kpak82 trades REVERSALS at extremes (RSI >80 or <20, broken EMA stack). Apply to ANY stock.
+7. MasterPandaWu: Elliott Wave + macro timing. Primary fit: SPY/QQQ/IWM/NVDA/broad market ETFs.
+   Also valid for any large-cap with clear Elliott Wave structure or macro sensitivity (NVDA, MAGS).
+8. puppy_trades: Elliott Wave + sector rotation. Primary tickers: URA, FSLR, ENPH, TAN, IBM,
+   TSLA, NVDA, PLTR, HOOD, OKTA. Also valid for ANY stock where a clear wave 2/4 correction has
+   completed and wave 3/5 impulse is beginning. Use for bullish setups with wave targets.
+9. CryptoKaleo: Pattern recognition and chart structure. Apply TA principles (bull flag, ascending
+   channel, HTF support/resistance, historical analog setups) to any stock — ignore crypto tickers.
+   Score higher when multiple chart patterns or historical cycle analogs converge.
 10. Earnings in 48h → penalise score heavily unless setup specifically targets earnings gap
 11. entry_note/stop_note/target_note: reference the STOCK price (not option premium) for levels.
     Option premium stop = 40-50% loss of premium paid. Be specific about price levels when possible.
@@ -363,9 +371,9 @@ def llm_score(
     model    = llm_cfg.get("model", "claude-opus-4-5")
 
     # ── Provider auto-selection ──────────────────────────────────────────────
-    # If provider is "ollama" (or no API key set), try local Ollama first
     use_ollama = provider == "ollama"
-    if not use_ollama and (not api_key or api_key == "PLACEHOLDER"):
+    use_vertex = provider == "vertex"
+    if not use_ollama and not use_vertex and (not api_key or api_key == "PLACEHOLDER"):
         if _ollama_available():
             logger.info("No API key set — auto-detected Ollama. Using local LLM.")
             use_ollama = True
@@ -378,6 +386,15 @@ def llm_score(
         logger.info(f"Using local Ollama model: {ollama_model}")
         if not _ollama_available():
             logger.warning("Ollama not running. Start with: brew services start ollama")
+            return []
+
+    if use_vertex:
+        from vertex_llm import is_vertex_configured
+        if not is_vertex_configured(llm_cfg):
+            logger.error(
+                "Vertex AI: set llm.project_id and auth (adc credentials_path or service account JSON) "
+                "(service account JSON with Vertex AI User role)"
+            )
             return []
 
     fw_parts = [
@@ -413,6 +430,9 @@ def llm_score(
             # Generic: any OpenAI-compatible endpoint — set base_url in config
             raw = _openai_call(prompt, api_key, model, llm_cfg,
                                base_url=llm_cfg.get("base_url"))
+        elif provider == "vertex":
+            from vertex_llm import vertex_chat
+            raw = vertex_chat(prompt, LLM_SYSTEM, llm_cfg)
         else:
             logger.error(f"Unknown LLM provider: {provider}")
             return []
@@ -640,11 +660,14 @@ def heuristic_score(ticker: dict) -> dict:
     score = round(score, 3)
 
     # Determine creator attribution
+    _MASTERPANDA_TICKERS = frozenset({"SPY","QQQ","IWM","NVDA","MSFT","AAPL","AMZN","GOOGL","META","TSLA"})
     creators: list[str] = []
     if ema_align or (rsi is not None and (rsi > 65 or rsi < 35)):
         creators.append("kpak82")
     if sector_match:
         creators.append("puppy_trades")
+    if symbol in _MASTERPANDA_TICKERS:
+        creators.append("MasterPandaWu")
 
     risk_level = "medium" if score >= 0.65 else "high"
     rationale  = (
@@ -693,8 +716,12 @@ def score_candidates(
     force_heuristic: bool = False,
 ) -> list[dict]:
     """Score all candidates. Use LLM when available, fall back per-ticker.
-    Batches into groups of 8 so the LLM JSON response never overflows."""
-    LLM_BATCH_SIZE = 8
+    Batches candidates so the LLM JSON response does not overflow."""
+    llm_cfg = config.get("llm", {})
+    LLM_BATCH_SIZE = int(
+        llm_cfg.get("batch_size")
+        or (4 if llm_cfg.get("provider") == "vertex" else 8)
+    )
     llm_results: list[dict] = []
     if not force_heuristic:
         if len(tickers) <= LLM_BATCH_SIZE:
@@ -1139,20 +1166,22 @@ def main() -> None:
     min_score  = args.min_score if args.min_score is not None else scan_cfg.get("min_score", 0.60)
     max_alerts = scan_cfg.get("max_daily_candidates", 2)
 
-    # ── Budget check ──────────────────────────────────────────────────────────
+    # ── Budget check (optional — disabled when weekly_trade_max is null/0) ───
+    weekly_cap = None if args.ignore_budget else get_weekly_trade_cap(config)
     budget = load_budget()
     used   = budget.get("surfaced_this_week", 0)
-    remaining = max(0, WEEKLY_BUDGET - used)
 
-    if not args.ignore_budget and used >= WEEKLY_BUDGET:
-        print(f"\n  📊 Weekly budget exhausted ({used}/{WEEKLY_BUDGET} alerts this week).")
-        print(f"  Budget resets on {budget['week_start']} + 7 days.")
-        print(f"  Use --ignore-budget to override.\n")
-        return
-
-    if not args.ignore_budget:
+    if weekly_cap is not None:
+        remaining = max(0, weekly_cap - used)
+        if used >= weekly_cap:
+            print(f"\n  📊 Weekly budget exhausted ({used}/{weekly_cap} alerts this week).")
+            print(f"  Budget resets on {budget['week_start']} + 7 days.")
+            print(f"  Set budget.weekly_trade_max to null in config.json to disable, or --ignore-budget.\n")
+            return
         max_alerts = min(max_alerts, remaining)
-        logger.info(f"Budget: {used}/{WEEKLY_BUDGET} used, {remaining} remaining this week")
+        logger.info(f"Budget: {used}/{weekly_cap} used, {remaining} remaining this week")
+    else:
+        logger.info(f"Budget: {used} alerts surfaced this week (no weekly cap)")
 
     all_data     = load_all_data()
     tickers      = all_data.get("tickers", [])
@@ -1243,9 +1272,9 @@ def main() -> None:
         except Exception as exc:
             logger.error(f"Archive write failed (non-fatal): {exc}")
 
-    # ── Update budget ─────────────────────────────────────────────────────────
-    if alerts and not args.dry_run and not args.ignore_budget:
-        save_budget(budget, used + len(alerts))
+    # ── Update budget counter (tracking only when cap disabled) ───────────────
+    if alerts and not args.dry_run:
+        save_budget(budget, used + len(alerts), weekly_cap)
 
     scan_meta = {
         "scan_timestamp": all_data.get("scan_timestamp"),
@@ -1256,8 +1285,11 @@ def main() -> None:
 
     if not args.dry_run:
         new_used = used + len(alerts)
-        print(f"  Budget: {new_used}/{WEEKLY_BUDGET} trades surfaced this week  "
-              f"({WEEKLY_BUDGET - new_used} remaining)\n")
+        if weekly_cap is not None:
+            print(f"  Budget: {new_used}/{weekly_cap} trades surfaced this week  "
+                  f"({weekly_cap - new_used} remaining)\n")
+        else:
+            print(f"  Alerts surfaced this week: {new_used} (no weekly cap)\n")
 
 
 if __name__ == "__main__":

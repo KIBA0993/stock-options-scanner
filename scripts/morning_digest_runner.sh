@@ -1,8 +1,6 @@
 #!/bin/bash
-# morning_digest_runner.sh
-# Runs at 9:40 AM ET every market day (Mon-Fri).
-# Runs the full scan pipeline first, then sends the morning digest email.
-# Even if no trades qualify, an email is always sent summarising the outlook.
+# morning_digest_runner.sh — LOCAL DEV ONLY (production runs on NAS at 9:45 AM ET).
+# LaunchAgents should stay in ~/Library/LaunchAgents/disabled/ to avoid duplicate emails.
 
 set -euo pipefail
 
@@ -15,6 +13,11 @@ mkdir -p "$TRADING_DIR/logs"
 echo "--- morning_digest_runner started $(date '+%Y-%m-%d %H:%M:%S ET') ---" >> "$LOG_FILE"
 
 cd "$TRADING_DIR"
+
+source "$TRADING_DIR/scripts/trading_day_guard.sh" >> "$LOG_FILE" 2>&1 || {
+  echo "NYSE closed today — skipping morning digest (Mac)" >> "$LOG_FILE"
+  exit 0
+}
 
 # 1. Scan (get latest market data)
 "$PYTHON" scanner.py    >> "$LOG_FILE" 2>&1 || true

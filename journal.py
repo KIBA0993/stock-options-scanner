@@ -14,6 +14,7 @@ Usage:
   journal.py summary [--weeks N]        # Win rate, R-multiple, per-creator breakdown
   journal.py list [--open] [--closed]   # List all trades
   journal.py verify [SYMBOL ...]        # Cross-check closed trades vs yfinance prices
+  journal.py backfill-sent [--week DATE] # Paper-log emailed alerts for a week
 
 R-multiple:
   R = (exit_price - entry_price) / (entry_price - stop_price)
@@ -32,17 +33,32 @@ from pathlib import Path
 from typing import Optional
 import logging
 
-from utils import load_budget, save_budget, monday_of_week  # noqa: E402
+from utils import (
+    load_budget,
+    save_budget,
+    get_weekly_trade_cap,
+    monday_of_week,
+    load_week_sent_alerts,
+    find_archive_alert,
+)
 
 BASE_DIR     = Path.home() / "trading"
 DATA_DIR     = BASE_DIR / "data"
 LOG_DIR      = BASE_DIR / "logs"
 JOURNAL_PATH = DATA_DIR / "trade_journal.jsonl"
 ALERTS_PATH  = DATA_DIR / "alerts.json"
+CONFIG_PATH  = BASE_DIR / "config.json"
 BUDGET_PATH  = DATA_DIR / "budget.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_config() -> dict:
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -267,7 +283,11 @@ def cmd_log(args: argparse.Namespace) -> None:
 
     print(f"\n  ✓ Logged trade: {trade_id}")
     print(f"    Entry: ${entry_price:.2f}  Stop: ${stop_price:.2f}  Target: ${target_price:.2f}")
-    print(f"    Budget this week: {budget['surfaced_this_week']}/10\n")
+    cap = get_weekly_trade_cap(_load_config())
+    if cap:
+        print(f"    Alerts this week: {budget['surfaced_this_week']}/{cap}\n")
+    else:
+        print(f"    Alerts this week: {budget['surfaced_this_week']} (no weekly cap)\n")
 
 
 def cmd_close(args: argparse.Namespace) -> None:
@@ -322,12 +342,17 @@ def cmd_status(args: argparse.Namespace) -> None:
     entries = load_journal()
     open_trades = [e for e in entries if e["exit_date"] is None]
     budget = load_budget()
+    cap = get_weekly_trade_cap(_load_config())
 
     print(f"\n{'─'*64}")
     print(f"  TRADE JOURNAL STATUS")
     print(f"{'─'*64}")
-    print(f"  Budget: {budget['surfaced_this_week']}/10 trades this week "
-          f"(week of {budget['week_start']})")
+    if cap:
+        print(f"  Alerts: {budget['surfaced_this_week']}/{cap} this week "
+              f"(week of {budget['week_start']})")
+    else:
+        print(f"  Alerts: {budget['surfaced_this_week']} this week, no cap "
+              f"(week of {budget['week_start']})")
 
     if open_trades:
         print(f"\n  Open Positions ({len(open_trades)}):")
@@ -540,6 +565,184 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print()
 
 
+def _contract_mid(archive: dict) -> Optional[float]:
+    """Pick slight_otm mid price from archived contract tiers, else ATM."""
+    rc = (archive or {}).get("recommended_contract") or {}
+    tiers = rc.get("tiers") or {}
+    for key in ("slight_otm", "atm", "affordable"):
+        tier = tiers.get(key)
+        if tier and tier.get("mid_price"):
+            return float(tier["mid_price"])
+    return None
+
+
+def _underlying_prices(symbol: str, entry_date: date, exit_date: date) -> tuple[Optional[float], Optional[float]]:
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, None
+
+    hist = yf.Ticker(symbol).history(
+        start=(entry_date - timedelta(days=5)).isoformat(),
+        end=(exit_date + timedelta(days=1)).isoformat(),
+        interval="1d",
+    )
+    if hist.empty:
+        return None, None
+    hist.index = hist.index.tz_localize(None)
+    entry_rows = hist[hist.index.date >= entry_date]
+    if entry_rows.empty:
+        entry_rows = hist.iloc[[0]]
+    exit_rows = hist[hist.index.date <= exit_date]
+    if exit_rows.empty:
+        exit_rows = hist.iloc[[-1]]
+    return float(entry_rows["Close"].iloc[0]), float(exit_rows["Close"].iloc[-1])
+
+
+def _paper_option_prices(
+    entry_price: float,
+    direction: str,
+    underlying_move: float,
+) -> tuple[float, float, float, str]:
+    """Synthesize option exit from underlying direction (paper backfill)."""
+    stop_price = round(entry_price * 0.50, 2)
+    correct = (direction == "call" and underlying_move > 0) or (
+        direction == "put" and underlying_move < 0
+    )
+    # calc_r_multiple for puts: lower exit = win, higher exit = loss (see test_journal.py)
+    if correct and abs(underlying_move) >= 3:
+        exit_price = round(entry_price * (2.0 if direction == "call" else 0.5), 2)
+        outcome = "target_hit"
+    elif correct:
+        exit_price = round(entry_price * (1.25 if direction == "call" else 0.75), 2)
+        outcome = "partial_win"
+    else:
+        exit_price = round(entry_price * (0.50 if direction == "call" else 1.50), 2)
+        outcome = "stop_hit"
+    r = calc_r_multiple(entry_price, exit_price, stop_price, direction)
+    return exit_price, stop_price, r, outcome
+
+
+def backfill_sent_alerts(week_start: date, dry_run: bool = False, force: bool = False) -> list[dict]:
+    """Create closed paper journal entries for emailed alerts in the given week."""
+    alerts = load_week_sent_alerts(week_start)
+    if not alerts:
+        return []
+
+    existing = load_journal()
+    if force and not dry_run:
+        kept = [
+            e for e in existing
+            if "Paper backfill from sent_history" not in (e.get("notes") or "")
+        ]
+        if len(kept) != len(existing):
+            JOURNAL_PATH.write_text(
+                "\n".join(json.dumps(e, default=str) for e in kept)
+                + ("\n" if kept else "")
+            )
+            existing = kept
+
+    existing_keys = {
+        (e["symbol"].upper(), e["direction"].lower(), e.get("entry_date", "")[:10])
+        for e in existing
+    }
+
+    created: list[dict] = []
+    exit_date = date.today().isoformat()
+
+    for alert in alerts:
+        symbol = alert["symbol"]
+        direction = alert["direction"]
+        entry_date = alert["sent_date"].isoformat()
+        if (symbol, direction, entry_date) in existing_keys:
+            logger.info(f"Skip backfill {symbol} {direction} — already journaled")
+            continue
+
+        archive = find_archive_alert(week_start, symbol, direction) or {}
+        entry_price = _contract_mid(archive) or 1.00
+        target_price = round(entry_price * 2.0, 2)
+
+        u_entry, u_exit = _underlying_prices(symbol, alert["sent_date"], date.today())
+        underlying_move = None
+        if u_entry and u_exit:
+            underlying_move = round((u_exit - u_entry) / u_entry * 100, 2)
+
+        if underlying_move is None:
+            logger.warning(f"Skip backfill {symbol} — no price data")
+            continue
+
+        exit_price, stop_price, pnl_r, outcome = _paper_option_prices(
+            entry_price, direction, underlying_move,
+        )
+
+        rc = (archive.get("recommended_contract") or {})
+        tiers = rc.get("tiers") or {}
+        strike = None
+        expiration = None
+        for tier in tiers.values():
+            if tier:
+                strike = tier.get("strike")
+                expiration = tier.get("expiration")
+                break
+
+        trade_id = f"{entry_date}-{symbol}-{direction}-paper-{len(created)+1:03d}"
+        entry = {
+            "id":               trade_id,
+            "symbol":           symbol,
+            "direction":        direction,
+            "alert_score":      alert.get("score") or archive.get("score"),
+            "alert_date":       entry_date,
+            "entry_date":       entry_date,
+            "entry_price":      entry_price,
+            "stop_price":       stop_price,
+            "target_price":     target_price,
+            "strike":           strike,
+            "expiration":       expiration,
+            "exit_date":        exit_date,
+            "exit_price":       exit_price,
+            "outcome":          outcome,
+            "pnl_r":            round(pnl_r, 3),
+            "underlying_entry": u_entry,
+            "underlying_exit":  u_exit,
+            "underlying_move":  underlying_move,
+            "creator_match":    archive.get("supporting_creators", []),
+            "scoring_method":   "sent_backfill",
+            "notes":            f"Paper backfill from sent_history. Underlying {underlying_move:+.1f}%.",
+            "logged_at":        datetime.now(timezone.utc).isoformat(),
+        }
+        created.append(entry)
+        if not dry_run:
+            append_entry(entry)
+
+    return created
+
+
+def cmd_backfill_sent(args: argparse.Namespace) -> None:
+    """Backfill paper trades from sent_history.json for a week."""
+    week_in = getattr(args, "week", None)
+    week_start = date.fromisoformat(week_in) if week_in else monday_of_week(date.today())
+    week_start = monday_of_week(week_start)
+    dry_run = getattr(args, "dry_run", False)
+
+    print(f"\n  Backfilling emailed alerts for week of {week_start} …")
+    if dry_run:
+        print("  (dry run — no writes)\n")
+
+    created = backfill_sent_alerts(week_start, dry_run=dry_run, force=getattr(args, "force", False))
+    if not created:
+        print("  No new entries to backfill.\n")
+        return
+
+    wins = sum(1 for e in created if (e.get("pnl_r") or 0) >= 0)
+    print(f"  {'Would create' if dry_run else 'Created'} {len(created)} paper trade(s)  "
+          f"({wins}/{len(created)} winners)\n")
+    for e in created:
+        icon = "✓" if (e.get("pnl_r") or 0) >= 0 else "✗"
+        print(f"    {icon} {e['symbol']:<6} {e['direction']:<4}  "
+              f"{e.get('underlying_move'):+.1f}%  {e.get('pnl_r'):+.2f}R  {e['id']}")
+    print()
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -580,6 +783,16 @@ def main() -> None:
     p_verify.add_argument("symbols", nargs="*",
                           help="Specific symbols to verify (default: all closed)")
 
+    # backfill-sent
+    p_bf = sub.add_parser("backfill-sent",
+                          help="Paper-log emailed alerts from sent_history.json")
+    p_bf.add_argument("--week", metavar="YYYY-MM-DD",
+                      help="Any date in the target week (default: current week)")
+    p_bf.add_argument("--dry-run", action="store_true",
+                      help="Preview entries without writing")
+    p_bf.add_argument("--force", action="store_true",
+                      help="Replace existing backfill entries for the week")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -589,16 +802,18 @@ def main() -> None:
         print("    journal.py log --from-alert BBCP         # log a trade from latest alert")
         print("    journal.py close BBCP --exit 4.10        # close with exit price")
         print("    journal.py summary                       # win rate + R-multiple")
+        print("    journal.py backfill-sent --week 2026-06-08 # paper-log emailed alerts")
         print("    journal.py list --open                   # show all open positions\n")
         return
 
     dispatch = {
-        "log":     cmd_log,
-        "close":   cmd_close,
-        "status":  cmd_status,
-        "summary": cmd_summary,
-        "list":    cmd_list,
-        "verify":  cmd_verify,
+        "log":           cmd_log,
+        "close":         cmd_close,
+        "status":        cmd_status,
+        "summary":       cmd_summary,
+        "list":          cmd_list,
+        "verify":        cmd_verify,
+        "backfill-sent": cmd_backfill_sent,
     }
     dispatch[args.command](args)
 
