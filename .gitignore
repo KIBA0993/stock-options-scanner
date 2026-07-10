@@ -1,7 +1,12 @@
 # ── Sensitive / secrets ─────────────────────────────────────────────────────
-config.json            # contains API keys — copy from config.json.template
-secrets/               # GCP service account JSON (gitignored)
-nas/nas.env            # NAS host/user — copy from nas.env.example
+# NOTE: git does not support inline (end-of-line) comments — each comment must
+# be on its own line, or the pattern is read literally and never matches.
+# contains API keys — copy from config.json.template
+config.json
+# GCP service account / ADC JSON
+secrets/
+# NAS host/user — copy from nas.env.example
+nas/nas.env
 
 # ── Runtime data (regenerated on each run) ───────────────────────────────────
 data/
