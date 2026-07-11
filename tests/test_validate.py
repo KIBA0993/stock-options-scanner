@@ -239,6 +239,63 @@ class TestScorecard:
         assert "0.70-0.79" in sc["by_horizon"]["h1"]["by_score"]
 
 
+# ─── paper-fill integration ─────────────────────────────────────────────────────
+class TestPaperFillOverride:
+    def test_apply_fill_override_sets_picked_tier_mid(self):
+        rc = {"tiers": {"atm": {"strike": 100, "expiration": "2026-07-31", "mid_price": 1.73}}}
+        out = v._apply_fill_override(rc, 1.95)
+        assert out["tiers"]["atm"]["mid_price"] == 1.95
+        # original not mutated
+        assert rc["tiers"]["atm"]["mid_price"] == 1.73
+
+    def test_apply_fill_override_targets_first_priced_tier(self):
+        rc = {"tiers": {"atm": {"mid_price": 0}, "slight_otm": {"mid_price": 1.0}}}
+        out = v._apply_fill_override(rc, 1.5)
+        assert out["tiers"]["atm"]["mid_price"] == 0      # untouched (unpriced)
+        assert out["tiers"]["slight_otm"]["mid_price"] == 1.5
+
+    def test_mark_uses_paper_fill_and_records_slippage(self, tmp_env, monkeypatch):
+        _, arch, valid = tmp_env
+        _write_archive(arch, "scored-20260601-0943.json", "2026-06-01T13:43:00+00:00",
+                       [_alert("NVDA", "call", mid=2.0)])
+        v.cmd_snapshot(_ns())
+        monkeypatch.setattr(v, "underlying_close_on",
+                            lambda sym, d: 100.0 if d == date(2026, 6, 1) else 105.0)
+        # capture the entry mid option_outcome sees
+        seen = {}
+        def fake_swing(alert, entry_date, hold_days, as_of):
+            tier = alert["recommended_contract"]["tiers"]["atm"]
+            seen["entry"] = tier["mid_price"]
+            return {"outcome_option_pnl_pct": 10.0, "entry_mid": tier["mid_price"], "exit_mid": 2.2}
+        monkeypatch.setattr(v, "fetch_swing_option_outcome", fake_swing)
+
+        fills = {"NVDA:call:2026-06-01": {"entry_fill": 2.3, "entry_mid": 2.0}}
+        monkeypatch.setattr(v, "load_paper_fills", lambda: fills)
+        v.cmd_mark(_ns())
+
+        oc = v.load_outcomes()["NVDA:call:2026-06-01"]
+        h1 = oc["horizons"]["h1"]
+        assert h1["entry_source"] == "paper_fill"
+        assert h1["paper_fill_price"] == 2.3
+        assert h1["fill_vs_mid_slippage_pct"] == 15.0        # (2.3-2.0)/2.0
+        assert seen["entry"] == 2.3                          # option_outcome used the fill, not 2.0
+
+    def test_mark_without_fill_uses_mid(self, tmp_env, monkeypatch):
+        _, arch, valid = tmp_env
+        _write_archive(arch, "scored-20260601-0943.json", "2026-06-01T13:43:00+00:00",
+                       [_alert("NVDA", "call", mid=2.0)])
+        v.cmd_snapshot(_ns())
+        monkeypatch.setattr(v, "underlying_close_on",
+                            lambda sym, d: 100.0 if d == date(2026, 6, 1) else 105.0)
+        monkeypatch.setattr(v, "fetch_swing_option_outcome",
+                            lambda *a, **k: {"outcome_option_pnl_pct": 5.0, "entry_mid": 2.0, "exit_mid": 2.1})
+        monkeypatch.setattr(v, "load_paper_fills", lambda: {})
+        v.cmd_mark(_ns())
+        h1 = v.load_outcomes()["NVDA:call:2026-06-01"]["horizons"]["h1"]
+        assert h1["entry_source"] == "mid"
+        assert "paper_fill_price" not in h1
+
+
 # ─── HTML scorecard ─────────────────────────────────────────────────────────────
 class TestHtmlScorecard:
     def _sc(self):

@@ -53,6 +53,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import json
 import logging
@@ -78,6 +79,7 @@ VALID_DIR      = DATA_DIR / "validation"
 LEDGER_PATH    = VALID_DIR / "prediction_ledger.jsonl"
 OUTCOMES_PATH  = VALID_DIR / "prediction_outcomes.json"
 SCORECARD_PATH = VALID_DIR / "scorecard.html"
+PAPER_FILLS_PATH = DATA_DIR / "paper" / "paper_fills.json"
 LOG_DIR        = BASE_DIR / "logs"
 
 DEFAULT_HORIZONS = [1, 3, 5]          # trading days
@@ -276,7 +278,32 @@ def _directional_correct(direction: str, move_pct: Optional[float]) -> Optional[
     return None
 
 
-def _mark_one(snap: dict, horizons: list[int], config: dict) -> dict:
+def load_paper_fills() -> dict[str, dict]:
+    """Real Alpaca paper fills keyed by prediction_id (from paper_broker sync)."""
+    if not PAPER_FILLS_PATH.exists():
+        return {}
+    try:
+        return json.loads(PAPER_FILLS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _apply_fill_override(recommended_contract: Optional[dict], fill_price: float) -> dict:
+    """Return a copy of recommended_contract with the priced tier option_outcome
+    would pick set to the real paper fill price (so option P&L uses the fill, not
+    the assumed mid)."""
+    rc = copy.deepcopy(recommended_contract or {})
+    tiers = rc.get("tiers") or {}
+    for key in ("atm", "slight_otm", "affordable"):
+        t = tiers.get(key)
+        if t and float(t.get("mid_price") or 0) > 0:
+            t["mid_price"] = float(fill_price)
+            break
+    return rc
+
+
+def _mark_one(snap: dict, horizons: list[int], config: dict,
+              paper_fills: Optional[dict] = None) -> dict:
     """Compute per-horizon outcomes for one prediction. Reconstructable + best-effort."""
     symbol    = snap["symbol"]
     direction = snap["direction"]
@@ -289,11 +316,24 @@ def _mark_one(snap: dict, horizons: list[int], config: dict) -> dict:
     per_h: dict[str, dict] = {}
     all_final = True
     has_contract = bool(snap.get("entry_contract"))
+
+    # Prefer a real Alpaca paper fill over the synthetic mid when one exists.
+    fill = (paper_fills or {}).get(snap["prediction_id"])
+    entry_source = "mid"
+    fill_slippage_pct: Optional[float] = None
+    recommended = snap.get("recommended_contract")
+    if fill and fill.get("entry_fill") and has_contract:
+        recommended = _apply_fill_override(recommended, float(fill["entry_fill"]))
+        entry_source = "paper_fill"
+        mid = fill.get("entry_mid")
+        if mid:
+            fill_slippage_pct = round((float(fill["entry_fill"]) - float(mid)) / float(mid) * 100, 2)
+
     # Reconstruct an alert-like dict for option_outcome (uses recommended_contract.tiers)
     alert_like = {
         "symbol": symbol,
         "direction": direction,
-        "recommended_contract": snap.get("recommended_contract"),
+        "recommended_contract": recommended,
     }
 
     for h in horizons:
@@ -335,6 +375,12 @@ def _mark_one(snap: dict, horizons: list[int], config: dict) -> dict:
             except Exception as exc:  # pragma: no cover - network/data dependent
                 logger.debug(f"option P&L failed {symbol} h{h}: {exc}")
 
+        # Whether option P&L used a real paper fill or the synthetic mid.
+        row["entry_source"] = entry_source
+        if entry_source == "paper_fill":
+            row["paper_fill_price"] = float(fill["entry_fill"])
+            row["fill_vs_mid_slippage_pct"] = fill_slippage_pct
+
         per_h[f"h{h}"] = row
 
     return {
@@ -355,6 +401,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
     horizons = get_horizons(config)
     ledger   = load_ledger()
     outcomes = load_outcomes()
+    fills    = load_paper_fills()
 
     if not ledger:
         print("mark: ledger is empty — run `validate.py snapshot` first.")
@@ -364,17 +411,29 @@ def cmd_mark(args: argparse.Namespace) -> int:
     skipped_final = 0
     for pid, snap in ledger.items():
         prev = outcomes.get(pid)
-        # Skip predictions already fully resolved (all horizons final) unless --force.
-        if prev and prev.get("all_final") and not args.force:
+        prev_used_fill = bool(prev and any(
+            h.get("entry_source") == "paper_fill"
+            for h in (prev.get("horizons") or {}).values()
+        ))
+        # A newly-arrived paper fill re-opens an otherwise-final prediction once,
+        # so its option P&L can switch from the assumed mid to the real fill.
+        needs_fill_update = (pid in fills) and not prev_used_fill
+        if prev and prev.get("all_final") and not args.force and not needs_fill_update:
             skipped_final += 1
             continue
-        outcomes[pid] = _mark_one(snap, horizons, config)
+        outcomes[pid] = _mark_one(snap, horizons, config, paper_fills=fills)
         updated += 1
 
     _save_outcomes(outcomes)
-    logger.info(f"mark: updated {updated}, already-final {skipped_final}, horizons={horizons}")
+    n_with_fills = sum(
+        1 for oc in outcomes.values()
+        if any(h.get("entry_source") == "paper_fill" for h in oc.get("horizons", {}).values())
+    )
+    logger.info(f"mark: updated {updated}, already-final {skipped_final}, "
+                f"paper-fill entries={n_with_fills}, horizons={horizons}")
     print(f"mark: updated {updated} prediction(s) "
-          f"({skipped_final} already final) at horizons {horizons} trading days.")
+          f"({skipped_final} already final; {n_with_fills} using real paper fills) "
+          f"at horizons {horizons} trading days.")
     return 0
 
 
@@ -407,6 +466,11 @@ def _agg(rows: list[dict]) -> dict:
             continue
         captured.append(m if r["direction"] == "call" else -m)
 
+    # Real paper fills vs assumed mids
+    paper = [r for r in rows if r.get("entry_source") == "paper_fill"]
+    slip = [r["fill_vs_mid_slippage_pct"] for r in paper
+            if r.get("fill_vs_mid_slippage_pct") is not None]
+
     return {
         "n":                 len(rows),
         "n_directional":     len(dir_known),
@@ -416,6 +480,8 @@ def _agg(rows: list[dict]) -> dict:
         "n_option":          len(opt),
         "option_win_rate":   round(100 * len(opt_wins) / len(opt), 1) if opt else None,
         "avg_option_pnl":    round(sum(opt) / len(opt), 1) if opt else None,
+        "n_paper_fill":      len(paper),
+        "avg_fill_slippage": round(sum(slip) / len(slip), 2) if slip else None,
     }
 
 
@@ -710,6 +776,11 @@ def cmd_report(args: argparse.Namespace) -> int:
         if ov["dir_hit_rate"] is not None:
             edge = ov["dir_hit_rate"] - 50.0
             print(f"     directional edge vs coin-flip: {edge:+.1f} pts{base}")
+        if ov.get("n_paper_fill"):
+            slip = ov.get("avg_fill_slippage")
+            slip_s = f", avg fill slippage {slip:+.1f}% vs mid" if slip is not None else ""
+            print(f"     option P&L on REAL paper fills: {ov['n_paper_fill']}/{ov['n_option']}"
+                  f"{slip_s}")
 
         if len(block["by_method"]) > 1 or block["by_method"]:
             print("     by scoring method:")

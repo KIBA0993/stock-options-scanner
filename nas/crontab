@@ -9,8 +9,14 @@
 # 10:05 AM — reprice backfill (fills contracts the 9:45 scan couldn't price yet)
 5 10 * * 1-5 /data/trading/nas/scripts/reprice_runner.sh
 
+# 10:06 AM — submit morning alerts as Alpaca PAPER orders (after contracts settle)
+6 10 * * 1-5 /data/trading/nas/scripts/paper_runner.sh submit
+
 # 12:45 PM — midday swing scan (email on new alerts)
 45 12 * * 1-5 /data/trading/nas/scripts/scan_runner.sh
+
+# 12:48 PM — submit midday alerts as PAPER orders (dedups vs morning)
+48 12 * * 1-5 /data/trading/nas/scripts/paper_runner.sh submit
 
 # 0–1 DTE intraday — every 10 min on trading days
 40,50 9 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh
@@ -27,6 +33,9 @@
 
 # 4:20 PM — framework backtest report (needs telemetry from same day)
 20 16 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh bash /data/trading/nas/scripts/framework_backtest_runner.sh
+
+# 4:30 PM — sync paper fills, then score the forward-validation scorecard
+30 16 * * 1-5 /data/trading/nas/scripts/validate_runner.sh
 
 # 5:15 PM Friday — weekly swing alert review (runs on holiday Fridays too)
 15 17 * * 5 /data/trading/nas/scripts/weekly_reflect_runner.sh
