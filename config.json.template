@@ -79,6 +79,11 @@
     "horizons_days": [1, 3, 5],
     "comment": "validate.py forward-test horizons (trading days). Run `python validate.py run` daily."
   },
+  "scoring": {
+    "primary": "llm",
+    "shadow": null,
+    "comment": "primary = which scorer surfaces alerts (llm|heuristic). shadow = also score every candidate with this scorer for A/B comparison (null to disable). validate.py breaks outcomes down by scoring_method."
+  },
   "data": {
     "fallback_provider": "none",
     "tiingo_api_key": "",

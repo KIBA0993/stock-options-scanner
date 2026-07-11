@@ -706,6 +706,98 @@ def _skip(symbol: str, reason: str, base: float = 0.0) -> dict:
     }
 
 
+# ─── Pluggable scorers ─────────────────────────────────────────────────────────
+# Each Scorer turns candidates into per-ticker evaluations. score_candidates picks
+# a primary scorer (falling back to the heuristic per unscored ticker) and can run
+# a second "shadow" scorer for A/B comparison — validate.py breaks results down
+# by scoring_method, so this is how you measure LLM vs heuristic on real outcomes.
+class Scorer:
+    name = "base"
+
+    def score(self, tickers: list[dict], frameworks: list[dict], config: dict,
+              context: Optional[str], session_note: str = "") -> list[dict]:
+        raise NotImplementedError
+
+
+class HeuristicScorer(Scorer):
+    """Rule-based scoring (no LLM) — see heuristic_score()."""
+    name = "heuristic"
+
+    def score(self, tickers, frameworks, config, context, session_note=""):
+        return [heuristic_score(t) for t in tickers]
+
+
+class LLMScorer(Scorer):
+    """LLM scoring with batching so the JSON response does not overflow."""
+    name = "llm"
+
+    def score(self, tickers, frameworks, config, context, session_note=""):
+        llm_cfg = config.get("llm", {})
+        batch_size = int(
+            llm_cfg.get("batch_size")
+            or (4 if llm_cfg.get("provider") == "vertex" else 8)
+        )
+        results: list[dict] = []
+        if len(tickers) <= batch_size:
+            results = llm_score(tickers, frameworks, config, context,
+                                session_note=session_note)
+        else:
+            batches = [tickers[i:i + batch_size]
+                       for i in range(0, len(tickers), batch_size)]
+            logger.info(
+                f"Large candidate set ({len(tickers)}): splitting into "
+                f"{len(batches)} LLM batches of ≤{batch_size}"
+            )
+            for i, batch in enumerate(batches, 1):
+                logger.info(f"  Batch {i}/{len(batches)}: {[t['symbol'] for t in batch]}")
+                results.extend(llm_score(batch, frameworks, config, context,
+                                         session_note=session_note))
+        for ev in results:
+            sym = ev.get("symbol", "").upper()
+            if sym:
+                ev["scoring_method"] = "llm"
+                # Normalise: prompt uses `risk_level`; `conviction` is canonical.
+                if ev.get("conviction") is None and ev.get("risk_level"):
+                    ev["conviction"] = ev["risk_level"]
+        return results
+
+
+SCORERS: dict[str, type[Scorer]] = {
+    "llm":       LLMScorer,
+    "heuristic": HeuristicScorer,
+}
+
+
+def get_scorer(name: str) -> Scorer:
+    """Instantiate a scorer by name; unknown names fall back to the LLM scorer."""
+    return SCORERS.get(name, LLMScorer)()
+
+
+def _index_by_symbol(evals: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for ev in evals:
+        sym = ev.get("symbol", "").upper()
+        if sym:
+            out[sym] = ev
+    return out
+
+
+def _fill_with_heuristic(tickers: list[dict], result_map: dict[str, dict],
+                         warn_label: Optional[str]) -> list[dict]:
+    """Return one eval per ticker, using result_map where present and the
+    heuristic scorer for any ticker the primary scorer missed."""
+    scored: list[dict] = []
+    for t in tickers:
+        sym = t["symbol"].upper()
+        if sym in result_map:
+            scored.append({**result_map[sym], "symbol": sym})
+        else:
+            if warn_label:
+                logger.warning(f"{warn_label} missing eval for {sym} — using heuristic")
+            scored.append(heuristic_score(t))
+    return scored
+
+
 # ─── Scoring Pipeline ──────────────────────────────────────────────────────────
 def score_candidates(
     tickers:         list[dict],
@@ -715,53 +807,36 @@ def score_candidates(
     session_note:    str = "",
     force_heuristic: bool = False,
 ) -> list[dict]:
-    """Score all candidates. Use LLM when available, fall back per-ticker.
-    Batches candidates so the LLM JSON response does not overflow."""
-    llm_cfg = config.get("llm", {})
-    LLM_BATCH_SIZE = int(
-        llm_cfg.get("batch_size")
-        or (4 if llm_cfg.get("provider") == "vertex" else 8)
-    )
-    llm_results: list[dict] = []
-    if not force_heuristic:
-        if len(tickers) <= LLM_BATCH_SIZE:
-            llm_results = llm_score(tickers, frameworks, config, context,
+    """Score all candidates with the primary scorer, falling back to the heuristic
+    per ticker the primary missed. Primary is 'heuristic' when force_heuristic,
+    else config.scoring.primary (default 'llm')."""
+    primary_name = "heuristic" if force_heuristic else config.get("scoring", {}).get("primary", "llm")
+    primary = get_scorer(primary_name)
+    primary_results = primary.score(tickers, frameworks, config, context,
                                     session_note=session_note)
-        else:
-            # Split into batches to avoid LLM response truncation
-            batches = [tickers[i:i+LLM_BATCH_SIZE]
-                       for i in range(0, len(tickers), LLM_BATCH_SIZE)]
-            logger.info(
-                f"Large candidate set ({len(tickers)}): splitting into "
-                f"{len(batches)} LLM batches of ≤{LLM_BATCH_SIZE}"
-            )
-            for i, batch in enumerate(batches, 1):
-                batch_syms = [t["symbol"] for t in batch]
-                logger.info(f"  Batch {i}/{len(batches)}: {batch_syms}")
-                batch_results = llm_score(batch, frameworks, config, context,
-                                          session_note=session_note)
-                llm_results.extend(batch_results)
+    result_map = _index_by_symbol(primary_results)
+    warn = primary_name if (primary_results and primary_name != "heuristic") else None
+    return _fill_with_heuristic(tickers, result_map, warn)
 
-    llm_map: dict[str, dict] = {}
-    for ev in llm_results:
-        sym = ev.get("symbol", "").upper()
-        if sym:
-            ev["scoring_method"] = "llm"
-            # Normalise: the prompt uses `risk_level`; `conviction` is the canonical field name
-            if ev.get("conviction") is None and ev.get("risk_level"):
-                ev["conviction"] = ev["risk_level"]
-            llm_map[sym] = ev
 
-    scored: list[dict] = []
-    for t in tickers:
-        sym = t["symbol"].upper()
-        if sym in llm_map:
-            scored.append({**llm_map[sym], "symbol": sym})
-        else:
-            if llm_results:
-                logger.warning(f"LLM missing eval for {sym} — using heuristic")
-            scored.append(heuristic_score(t))
-
+def shadow_score(
+    tickers:      list[dict],
+    frameworks:   list[dict],
+    config:       dict,
+    context:      Optional[str],
+    session_note: str = "",
+) -> list[dict]:
+    """Run the configured shadow scorer (config.scoring.shadow) over all candidates
+    for A/B comparison. Returns [] when unconfigured. Never affects live alerts —
+    the output is archived alongside all_scored for validate.py to compare."""
+    name = config.get("scoring", {}).get("shadow")
+    if not name or name not in SCORERS:
+        return []
+    scorer = get_scorer(name)
+    results = scorer.score(tickers, frameworks, config, context, session_note=session_note)
+    scored = _fill_with_heuristic(tickers, _index_by_symbol(results), None)
+    for ev in scored:
+        ev["scoring_method"] = name
     return scored
 
 
@@ -1205,6 +1280,17 @@ def main() -> None:
         force_heuristic=args.no_llm,
     )
 
+    # ── Shadow scorer (A/B) — score the same candidates with the alternate
+    # scorer for comparison, without affecting which alerts are surfaced. ──────
+    shadow_scored = shadow_score(
+        tickers, frameworks, config, context, session_note=session_note,
+    ) if not args.no_llm else []
+    if shadow_scored:
+        logger.info(
+            f"Shadow scorer '{config.get('scoring', {}).get('shadow')}' scored "
+            f"{len(shadow_scored)} candidate(s) for comparison"
+        )
+
     # ── Enrich with would_have_direction before filter strips skips ───────────
     # Store the direction each candidate would have taken if it hadn't been skipped.
     # Used by reflect.py to evaluate whether a skip was correct.
@@ -1266,6 +1352,7 @@ def main() -> None:
             archive_path.write_text(json.dumps({
                 "scan_timestamp": all_data.get("scan_timestamp"),
                 "all_scored":     all_scored,
+                "shadow_scored":  shadow_scored,
                 "alerts":         alerts,
             }, indent=2, default=str))
             logger.info(f"Scored archive written → {archive_path}")
