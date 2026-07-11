@@ -83,5 +83,14 @@
     "fallback_provider": "none",
     "tiingo_api_key": "",
     "comment": "Fallback price source when yfinance returns empty. Set fallback_provider to 'tiingo' and add a free key from tiingo.com. 'none' = yfinance only (default)."
+  },
+  "alpaca": {
+    "enabled": false,
+    "paper": true,
+    "api_key_id": "",
+    "api_secret_key": "",
+    "base_url": "https://paper-api.alpaca.markets",
+    "qty": 1,
+    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py."
   }
 }

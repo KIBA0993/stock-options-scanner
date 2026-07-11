@@ -20,5 +20,8 @@ google-auth>=2.29.0
 # HTTP
 requests>=2.31.0
 
+# Paper execution (P2-2 — optional; only needed when alpaca.enabled=true)
+# alpaca-py>=0.30.0
+
 # Testing
 pytest>=8.0.0
