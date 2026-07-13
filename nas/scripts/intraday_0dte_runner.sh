@@ -22,7 +22,13 @@ HC="$TRADING_DIR/nas/scripts/healthcheck.sh"
 }
 
 "$PYTHON" intraday_0dte.py >> "$LOG_FILE" 2>&1
-
 EXIT_CODE=$?
+
+# Mirror the intraday entry/exit alerts into Alpaca PAPER (no-op unless
+# alpaca.enabled=true and alpaca.intraday_enabled=true). Non-fatal: a broker
+# hiccup must never fail the scan.
+"$PYTHON" paper_broker.py intraday-submit >> "$LOG_FILE" 2>&1 || true
+"$PYTHON" paper_broker.py intraday-exit   >> "$LOG_FILE" 2>&1 || true
+
 echo "--- intraday_0dte_runner exited code=$EXIT_CODE $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> "$LOG_FILE"
 exit $EXIT_CODE

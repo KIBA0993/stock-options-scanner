@@ -38,12 +38,24 @@ they fill without a live quote feed; `sync_fills()` then captures the real exit
 fill and the round-trip P&L, which `validate.py` folds into the scorecard in
 place of the modeled exit mid.
 
+Intraday 0DTE
+-------------
+`submit_intraday()` / `exit_intraday()` mirror the intraday alert stream into the
+same paper account: buy on each intraday entry alert, sell on its matching exit
+alert (reversal / premium-stop / flip) and force-close at EOD so no 0DTE is held
+overnight. Gated by `alpaca.intraday_enabled` (default true) on top of
+`alpaca.enabled`. Keyed by the entry timestamp, so intraday round trips are
+tracked separately from swing and reported via `intraday-report`.
+
 CLI
 ---
-  python paper_broker.py submit [--dry-run]   # submit today's alerts.json as paper orders
-  python paper_broker.py exit   [--dry-run]   # sell-to-close positions past their hold window
-  python paper_broker.py sync                  # refresh entry+exit fills from Alpaca
-  python paper_broker.py status                # show tracked paper orders + fills
+  python paper_broker.py submit [--dry-run]           # swing: submit alerts.json as paper orders
+  python paper_broker.py exit   [--dry-run]           # swing: sell-to-close past the hold window
+  python paper_broker.py intraday-submit [--dry-run]  # intraday: buy-to-open today's entry alerts
+  python paper_broker.py intraday-exit   [--dry-run]  # intraday: sell-to-close (exit alert / EOD)
+  python paper_broker.py intraday-report              # intraday: today's closed round trips
+  python paper_broker.py sync                          # refresh entry+exit fills from Alpaca
+  python paper_broker.py status                        # show tracked paper orders + fills
 """
 
 from __future__ import annotations
@@ -52,15 +64,17 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from market_calendar import is_trading_day
 
 BASE_DIR      = Path.home() / "trading"
 DATA_DIR      = BASE_DIR / "data"
 ALERTS_PATH   = DATA_DIR / "alerts.json"
+INTRADAY_ALERTS_PATH = DATA_DIR / "intraday_0dte_alerts.jsonl"
 CONFIG_PATH   = BASE_DIR / "config.json"
 PAPER_DIR     = DATA_DIR / "paper"
 ORDERS_PATH   = PAPER_DIR / "paper_orders.jsonl"
@@ -68,6 +82,8 @@ FILLS_PATH    = PAPER_DIR / "paper_fills.json"
 LOG_DIR       = BASE_DIR / "logs"
 
 PAPER_HOST = "paper-api.alpaca.markets"
+ET = ZoneInfo("America/New_York")
+DEFAULT_EOD_EXIT_TIME = "15:45"          # matches intraday_0dte.DEFAULT_EOD_EXIT_TIME
 
 
 def _setup_logging() -> logging.Logger:
@@ -98,6 +114,13 @@ def alpaca_cfg(config: Optional[dict] = None) -> dict:
 
 def is_enabled(config: Optional[dict] = None) -> bool:
     return bool(alpaca_cfg(config).get("enabled"))
+
+
+def intraday_enabled(config: Optional[dict] = None) -> bool:
+    """Intraday 0DTE paper execution — gated by alpaca.enabled AND an opt-out
+    sub-flag (default on) so swing paper trading can run without intraday."""
+    cfg = alpaca_cfg(config)
+    return bool(cfg.get("enabled")) and bool(cfg.get("intraday_enabled", True))
 
 
 def _assert_paper(cfg: dict) -> None:
@@ -457,6 +480,212 @@ def exit_positions(config: Optional[dict] = None, dry_run: bool = False) -> dict
             "dry_run": dry_run, "orders": records}
 
 
+# ─── Intraday 0DTE paper execution ───────────────────────────────────────────────
+# The intraday scanner already emits entry alerts and exit alerts (reversal /
+# premium-stop / EOD / flip) linked by `exit_for_entry_ts`. Paper execution simply
+# mirrors that stream: buy-to-open on each entry alert, sell-to-close on its
+# matching exit alert, and force-close anything still open at EOD (0DTE must never
+# be held overnight). Keyed by the entry's scan_timestamp so re-entries on the same
+# symbol/direction later in the day are tracked as separate trades.
+
+def load_intraday_alerts() -> list[dict]:
+    """All intraday 0DTE alert records (entries + exits), newest last."""
+    if not INTRADAY_ALERTS_PATH.exists():
+        return []
+    out = []
+    for line in INTRADAY_ALERTS_PATH.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def intraday_prediction_id(alert: dict) -> str:
+    """Unique per intraday entry — includes the scan timestamp (not just the day),
+    so multiple same-symbol re-entries don't collide."""
+    return (f"{alert['symbol'].upper()}:{alert['direction'].lower()}:"
+            f"{alert['scan_timestamp']}")
+
+
+def intraday_entries_on(alerts: list[dict], day_str: str) -> list[dict]:
+    """Entry alerts (call/put, action=entry) scanned on `day_str`."""
+    return [
+        a for a in alerts
+        if str(a.get("scan_timestamp", "")).startswith(day_str)
+        and a.get("alert_action", "entry") == "entry"
+        and str(a.get("direction", "")).lower() in ("call", "put")
+    ]
+
+
+def intraday_order_from_alert(alert: dict, qty: int = 1) -> Optional[dict]:
+    """Buy-to-open order for an intraday entry alert, or None if unpriced.
+    Tagged strategy=intraday and keyed by the entry timestamp."""
+    order = alert_to_order(alert, scan_date=None, qty=qty)
+    if not order:
+        return None
+    order["strategy"] = "intraday"
+    order["entry_ref_ts"] = alert["scan_timestamp"]
+    order["prediction_id"] = intraday_prediction_id(alert)
+    return order
+
+
+def _submitted_intraday_refs() -> set[str]:
+    """Entry timestamps already submitted as intraday paper orders — for dedup."""
+    return {
+        o["entry_ref_ts"] for o in load_orders()
+        if o.get("strategy") == "intraday" and o.get("entry_ref_ts")
+    }
+
+
+def select_intraday_exits(
+    entry_orders: list[dict],
+    alerts_pool: list[dict],
+    closed_pids: set[str],
+    eod: bool,
+) -> list[dict]:
+    """Pure: intraday entry orders due to close — because a matching exit alert
+    fired, or because it is past EOD (0DTE force-close). Skips already-closed."""
+    due = []
+    for o in entry_orders:
+        if o.get("strategy") != "intraday" or str(o.get("side", "buy")) != "buy":
+            continue
+        pid = o.get("prediction_id")
+        if pid and pid in closed_pids:
+            continue
+        ref = o.get("entry_ref_ts")
+        has_exit_alert = any(
+            r.get("alert_action") == "exit" and r.get("exit_for_entry_ts") == ref
+            for r in alerts_pool
+        )
+        if eod or has_exit_alert:
+            due.append(o)
+    return due
+
+
+def _is_past_eod_exit(intraday_cfg: dict, now: Optional[datetime] = None) -> bool:
+    """True once the ET wall-clock is at/after the intraday EOD exit time."""
+    if not intraday_cfg.get("eod_exit_enabled", True):
+        return False
+    now = now or datetime.now(ET)
+    hhmm = str(intraday_cfg.get("eod_exit_time", DEFAULT_EOD_EXIT_TIME))
+    try:
+        h, m = (int(x) for x in hhmm.split(":")[:2])
+    except ValueError:
+        h, m = 15, 45
+    return now.timetz().replace(tzinfo=None) >= dtime(h, m)
+
+
+def submit_intraday(config: Optional[dict] = None, dry_run: bool = False) -> dict:
+    """Buy-to-open each of today's intraday entry alerts once. Idempotent per
+    entry timestamp."""
+    config = config or load_config()
+    if not intraday_enabled(config):
+        logger.info("intraday paper disabled — not submitting")
+        return {"enabled": False, "submitted": 0, "skipped": 0}
+
+    cfg = alpaca_cfg(config)
+    _assert_paper(cfg)
+    qty = int(cfg.get("qty", 1))
+    day_str = date.today().isoformat()
+    entries = intraday_entries_on(load_intraday_alerts(), day_str)
+    already = _submitted_intraday_refs()
+
+    client = None if dry_run else _client(cfg)
+    submitted, skipped, records = 0, 0, []
+    for a in entries:
+        ref = a.get("scan_timestamp")
+        if not ref or ref in already:
+            skipped += 1
+            continue
+        order = intraday_order_from_alert(a, qty=qty)
+        if not order:
+            skipped += 1
+            logger.info(f"skip intraday {a.get('symbol')} — no priced contract")
+            continue
+        already.add(ref)
+        rec = {**order, "submitted_at": _now(),
+               "status": "dry_run" if dry_run else "submitted"}
+        if not dry_run:
+            try:
+                resp = client.submit_order(_to_alpaca_request(order))
+                rec["order_id"] = str(getattr(resp, "id", "") or "")
+                rec["status"] = str(getattr(resp, "status", "submitted"))
+            except Exception as exc:
+                rec["status"] = "error"
+                rec["error"] = str(exc)
+                logger.error(f"intraday submit failed {order['occ_symbol']}: {exc}")
+        records.append(rec)
+        submitted += 1
+        logger.info(f"{'[dry-run] ' if dry_run else ''}intraday order {order['occ_symbol']} "
+                    f"{order['qty']}x @ {order['type']} {order.get('limit_price','')}")
+
+    if records and not dry_run:
+        _append_orders(records)
+    return {"enabled": True, "submitted": submitted, "skipped": skipped,
+            "dry_run": dry_run, "orders": records}
+
+
+def exit_intraday(config: Optional[dict] = None, dry_run: bool = False) -> dict:
+    """Sell-to-close intraday positions whose exit alert fired or that are past
+    EOD. Idempotent per prediction."""
+    config = config or load_config()
+    if not intraday_enabled(config):
+        logger.info("intraday paper disabled — not exiting")
+        return {"enabled": False, "exited": 0, "skipped": 0}
+
+    cfg = alpaca_cfg(config)
+    _assert_paper(cfg)
+    icfg = config.get("intraday_0dte", {})
+    eod = _is_past_eod_exit(icfg)
+    day_str = date.today().isoformat()
+    pool = [a for a in load_intraday_alerts()
+            if str(a.get("scan_timestamp", "")).startswith(day_str)]
+    closed = _closed_prediction_ids()
+    entries = [o for o in load_orders()
+               if o.get("strategy") == "intraday" and str(o.get("side", "buy")) == "buy"]
+    due = select_intraday_exits(entries, pool, closed, eod)
+
+    client = None if dry_run else _client(cfg)
+    positions = _open_positions(client) if client is not None else {}
+
+    exited, skipped, records = 0, 0, []
+    for o in due:
+        occ = o["occ_symbol"]
+        held_qty = positions.get(occ)
+        if not dry_run and not held_qty:
+            skipped += 1
+            logger.info(f"skip intraday exit {occ} — no open position")
+            continue
+        qty = min(int(o.get("qty", 1)), int(held_qty)) if held_qty else int(o.get("qty", 1))
+        exit_order = build_exit_order(o, qty=qty)
+        exit_order["strategy"] = "intraday"
+        rec = {**exit_order, "submitted_at": _now(),
+               "status": "dry_run" if dry_run else "submitted"}
+        if not dry_run:
+            try:
+                resp = client.submit_order(_to_alpaca_request(exit_order))
+                rec["order_id"] = str(getattr(resp, "id", "") or "")
+                rec["status"] = str(getattr(resp, "status", "submitted"))
+            except Exception as exc:
+                rec["status"] = "error"
+                rec["error"] = str(exc)
+                logger.error(f"intraday exit failed {occ}: {exc}")
+        records.append(rec)
+        exited += 1
+        if o.get("prediction_id"):
+            closed.add(o["prediction_id"])
+        logger.info(f"{'[dry-run] ' if dry_run else ''}intraday exit {occ} {qty}x SELL "
+                    f"market ({'EOD' if eod else 'exit-alert'})")
+
+    if records and not dry_run:
+        _append_orders(records)
+    return {"enabled": True, "exited": exited, "skipped": skipped,
+            "dry_run": dry_run, "orders": records}
+
+
 # ─── Sync fills + reconcile to validator ────────────────────────────────────────
 def sync_fills(config: Optional[dict] = None) -> dict:
     """Refresh entry+exit fill status/price for tracked orders and write
@@ -515,6 +744,7 @@ def reconcile(orders: list[dict], order_status: dict[str, dict]) -> dict[str, di
         fills[pid] = {
             "occ_symbol": o.get("occ_symbol"),
             "order_id":   oid,
+            "strategy":   o.get("strategy", "swing"),
             "entry_fill": float(price),
             "entry_mid":  o.get("entry_mid"),
             "qty":        o.get("qty"),
@@ -535,7 +765,8 @@ def reconcile(orders: list[dict], order_status: dict[str, dict]) -> dict[str, di
         price = st.get("filled_avg_price")
         if price is None:
             continue
-        rec = fills.get(pid, {"occ_symbol": o.get("occ_symbol")})
+        rec = fills.get(pid, {"occ_symbol": o.get("occ_symbol"),
+                              "strategy": o.get("strategy", "swing")})
         rec["exit_fill"] = float(price)
         rec["exit_order_id"] = oid
         rec["exit_status"] = st.get("status")
@@ -545,6 +776,28 @@ def reconcile(orders: list[dict], order_status: dict[str, dict]) -> dict[str, di
             rec["round_trip_pnl_pct"] = round((float(price) - float(entry)) / float(entry) * 100, 2)
         fills[pid] = rec
     return fills
+
+
+def intraday_report(config: Optional[dict] = None) -> dict:
+    """Summarize today's closed intraday paper round trips from paper_fills.json."""
+    fills = {}
+    if FILLS_PATH.exists():
+        try:
+            fills = json.loads(FILLS_PATH.read_text())
+        except Exception:
+            fills = {}
+    rows = [f for f in fills.values() if f.get("strategy") == "intraday"]
+    closed = [f for f in rows if f.get("round_trip_pnl_pct") is not None]
+    open_legs = [f for f in rows if f.get("entry_fill") and f.get("exit_fill") is None]
+    pnl = [f["round_trip_pnl_pct"] for f in closed]
+    wins = [p for p in pnl if p > 0]
+    return {
+        "intraday_orders": len(rows),
+        "closed_round_trips": len(closed),
+        "still_open": len(open_legs),
+        "win_rate": round(100 * len(wins) / len(pnl), 1) if pnl else None,
+        "avg_round_trip_pnl": round(sum(pnl) / len(pnl), 1) if pnl else None,
+    }
 
 
 def _now() -> str:
@@ -559,6 +812,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     s.add_argument("--dry-run", action="store_true")
     e = sub.add_parser("exit", help="Sell-to-close positions past their hold window")
     e.add_argument("--dry-run", action="store_true")
+    isub = sub.add_parser("intraday-submit", help="Buy-to-open today's intraday 0DTE entry alerts")
+    isub.add_argument("--dry-run", action="store_true")
+    ix = sub.add_parser("intraday-exit", help="Sell-to-close intraday positions (exit alert / EOD)")
+    ix.add_argument("--dry-run", action="store_true")
+    sub.add_parser("intraday-report", help="Summarize today's intraday paper round trips")
     sub.add_parser("sync", help="Refresh entry+exit fills from Alpaca")
     sub.add_parser("status", help="Show tracked paper orders")
     args = p.parse_args(argv)
@@ -578,6 +836,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             tag = "[dry-run] " if r.get("dry_run") else ""
             print(f"{tag}exited {r['exited']}, skipped {r['skipped']}.")
+        return 0
+    if args.command == "intraday-submit":
+        r = submit_intraday(dry_run=args.dry_run)
+        if not r.get("enabled"):
+            print("intraday paper disabled (alpaca.enabled / alpaca.intraday_enabled).")
+        else:
+            tag = "[dry-run] " if r.get("dry_run") else ""
+            print(f"{tag}intraday submitted {r['submitted']}, skipped {r['skipped']}.")
+        return 0
+    if args.command == "intraday-exit":
+        r = exit_intraday(dry_run=args.dry_run)
+        if not r.get("enabled"):
+            print("intraday paper disabled (alpaca.enabled / alpaca.intraday_enabled).")
+        else:
+            tag = "[dry-run] " if r.get("dry_run") else ""
+            print(f"{tag}intraday exited {r['exited']}, skipped {r['skipped']}.")
+        return 0
+    if args.command == "intraday-report":
+        r = intraday_report()
+        print(f"intraday paper: {r['closed_round_trips']} closed round trip(s), "
+              f"{r['still_open']} open"
+              + (f", win {r['win_rate']:.0f}%, avg {r['avg_round_trip_pnl']:+.1f}%"
+                 if r['win_rate'] is not None else ""))
         return 0
     if args.command == "sync":
         r = sync_fills()

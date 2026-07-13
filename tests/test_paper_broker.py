@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -275,3 +275,146 @@ class TestReconcileExits:
         assert f["exit_fill"] == 1.50
         assert "round_trip_pnl_pct" not in f
         assert "entry_fill" not in f
+
+    def test_tags_strategy_on_fill(self):
+        orders = [{"side": "buy", "order_id": "o1", "prediction_id": "SPY:call:T1",
+                   "occ_symbol": "SPY260713C00550000", "strategy": "intraday", "entry_mid": 1.0}]
+        status = {"o1": {"filled_avg_price": 1.1, "status": "filled"}}
+        assert pb.reconcile(orders, status)["SPY:call:T1"]["strategy"] == "intraday"
+
+
+# ─── intraday 0DTE paper ─────────────────────────────────────────────────────────
+def _today_ts(hhmm="10:20:00"):
+    return f"{date.today().isoformat()}T{hhmm}-04:00"
+
+
+def _intraday_entry(symbol="SPY", direction="call", ts=None, mid=1.2, ask=1.3, strike=550):
+    return {
+        "symbol": symbol, "direction": direction, "score": 0.75,
+        "alert_action": "entry", "scan_timestamp": ts or _today_ts(),
+        "recommended_contract": {"tiers": {"atm": {
+            "strike": strike, "expiration": date.today().isoformat(), "direction": direction,
+            "bid": mid - 0.1, "ask": ask, "mid_price": mid, "cost_per_contract": mid * 100}}},
+    }
+
+
+def _intraday_exit(entry_ts, symbol="SPY", direction="call", ts=None):
+    return {"symbol": symbol, "direction": direction, "alert_action": "exit",
+            "scan_timestamp": ts or _today_ts("11:00:00"), "exit_for_entry_ts": entry_ts}
+
+
+class TestIntradayHelpers:
+    def test_prediction_id_includes_timestamp(self):
+        a = _intraday_entry(ts="2026-07-13T10:20:00-04:00")
+        assert pb.intraday_prediction_id(a) == "SPY:call:2026-07-13T10:20:00-04:00"
+
+    def test_entries_on_filters_action_direction_and_day(self):
+        pool = [
+            _intraday_entry(ts=_today_ts("10:00:00")),
+            _intraday_exit(_today_ts("10:00:00")),                       # exit — excluded
+            {"symbol": "SPY", "direction": "skip", "alert_action": "entry",
+             "scan_timestamp": _today_ts("10:05:00")},                    # skip dir — excluded
+            _intraday_entry(ts="2020-01-01T10:00:00-04:00"),              # other day — excluded
+        ]
+        got = pb.intraday_entries_on(pool, date.today().isoformat())
+        assert len(got) == 1 and got[0]["alert_action"] == "entry"
+
+    def test_order_from_alert_tags_intraday(self):
+        a = _intraday_entry(ts="2026-07-13T10:20:00-04:00", mid=1.2, ask=1.3)
+        o = pb.intraday_order_from_alert(a, qty=1)
+        assert o["side"] == "buy"
+        assert o["strategy"] == "intraday"
+        assert o["entry_ref_ts"] == "2026-07-13T10:20:00-04:00"
+        assert o["prediction_id"] == "SPY:call:2026-07-13T10:20:00-04:00"
+        assert o["limit_price"] == 1.3                                    # buys at the ask
+
+    def test_order_from_alert_none_when_unpriced(self):
+        a = _intraday_entry()
+        a["recommended_contract"] = {"tiers": {}}
+        assert pb.intraday_order_from_alert(a) is None
+
+    def test_eod_exit_time_boundary(self):
+        cfg = {"eod_exit_enabled": True, "eod_exit_time": "15:45"}
+        assert pb._is_past_eod_exit(cfg, datetime(2026, 7, 13, 15, 50, tzinfo=pb.ET)) is True
+        assert pb._is_past_eod_exit(cfg, datetime(2026, 7, 13, 10, 0, tzinfo=pb.ET)) is False
+        assert pb._is_past_eod_exit({"eod_exit_enabled": False},
+                                    datetime(2026, 7, 13, 15, 50, tzinfo=pb.ET)) is False
+
+
+class TestSelectIntradayExits:
+    def _entry_order(self, ref="T1", pid="SPY:call:T1", occ="SPY260713C00550000"):
+        return {"strategy": "intraday", "side": "buy", "occ_symbol": occ,
+                "entry_ref_ts": ref, "prediction_id": pid}
+
+    def test_closes_on_matching_exit_alert(self):
+        orders = [self._entry_order()]
+        pool = [_intraday_exit("T1")]
+        due = pb.select_intraday_exits(orders, pool, closed_pids=set(), eod=False)
+        assert [o["prediction_id"] for o in due] == ["SPY:call:T1"]
+
+    def test_closes_all_at_eod(self):
+        orders = [self._entry_order()]
+        due = pb.select_intraday_exits(orders, [], closed_pids=set(), eod=True)
+        assert len(due) == 1
+
+    def test_skips_when_no_exit_and_not_eod(self):
+        orders = [self._entry_order()]
+        assert pb.select_intraday_exits(orders, [], closed_pids=set(), eod=False) == []
+
+    def test_skips_already_closed(self):
+        orders = [self._entry_order()]
+        due = pb.select_intraday_exits(orders, [_intraday_exit("T1")],
+                                       closed_pids={"SPY:call:T1"}, eod=True)
+        assert due == []
+
+
+class TestIntradayGating:
+    def test_disabled_when_alpaca_off(self):
+        assert pb.intraday_enabled({"alpaca": {"enabled": False}}) is False
+
+    def test_on_by_default_when_alpaca_on(self):
+        assert pb.intraday_enabled({"alpaca": {"enabled": True}}) is True
+
+    def test_opt_out_flag(self):
+        assert pb.intraday_enabled({"alpaca": {"enabled": True, "intraday_enabled": False}}) is False
+
+    def test_submit_noops_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("must not build client"))
+        r = pb.submit_intraday(config={"alpaca": {"enabled": True, "intraday_enabled": False}})
+        assert r == {"enabled": False, "submitted": 0, "skipped": 0}
+
+
+class TestIntradaySubmitDryRun:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        paper = tmp_path / "paper"; paper.mkdir(parents=True)
+        monkeypatch.setattr(pb, "PAPER_DIR", paper)
+        monkeypatch.setattr(pb, "ORDERS_PATH", paper / "paper_orders.jsonl")
+        monkeypatch.setattr(pb, "INTRADAY_ALERTS_PATH", tmp_path / "intraday.jsonl")
+        rows = [
+            _intraday_entry("SPY", "call", ts=_today_ts("10:20:00")),
+            _intraday_entry("QQQ", "put", ts=_today_ts("10:20:05"), strike=480),
+        ]
+        (tmp_path / "intraday.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return tmp_path
+
+    def test_dry_run_submits_priced_entries(self, env, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("dry-run must not build client"))
+        cfg = {"alpaca": {"enabled": True, "paper": True,
+                          "base_url": "https://paper-api.alpaca.markets"}}
+        r = pb.submit_intraday(config=cfg, dry_run=True)
+        assert r["submitted"] == 2
+        assert all(o["strategy"] == "intraday" for o in r["orders"])
+        assert not pb.ORDERS_PATH.exists()                               # nothing persisted on dry-run
+
+    def test_dedups_against_already_submitted(self, env, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("dry-run must not build client"))
+        # pre-record one of the two entries as already submitted
+        pb.ORDERS_PATH.write_text(json.dumps(
+            {"strategy": "intraday", "entry_ref_ts": _today_ts("10:20:00"),
+             "occ_symbol": "SPY260713C00550000"}) + "\n")
+        cfg = {"alpaca": {"enabled": True, "paper": True,
+                          "base_url": "https://paper-api.alpaca.markets"}}
+        r = pb.submit_intraday(config=cfg, dry_run=True)
+        assert r["submitted"] == 1                                       # only the QQQ entry
+        assert r["skipped"] == 1

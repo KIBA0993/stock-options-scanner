@@ -97,6 +97,7 @@
     "base_url": "https://paper-api.alpaca.markets",
     "qty": 1,
     "hold_trading_days": 5,
-    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py. hold_trading_days = sessions to hold before auto sell-to-close (defaults to the largest validation horizon)."
+    "intraday_enabled": true,
+    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py. hold_trading_days = swing sessions to hold before auto sell-to-close (defaults to the largest validation horizon). intraday_enabled mirrors the 0DTE alert stream (buy on entry alert, sell on exit alert / EOD); set false to paper-trade swing only."
   }
 }
