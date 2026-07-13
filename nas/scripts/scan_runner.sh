@@ -31,7 +31,12 @@ pip install --quiet openai google-auth 2>/dev/null || pip install openai google-
 "$PYTHON" scanner.py     >> "$LOG_FILE" 2>&1 || true
 "$PYTHON" orchestrate.py >> "$LOG_FILE" 2>&1 || true
 "$PYTHON" notify.py --channel email >> "$LOG_FILE" 2>&1
-
 EXIT_CODE=$?
+
+# Submit midday paper orders immediately (Alpaca-priced fallback). No-op unless
+# alpaca.enabled=true. The 12:48 cron submit remains an idempotent retry.
+"$PYTHON" paper_broker.py submit >> "$TRADING_DIR/logs/paper_broker.log" 2>&1 || true
+
+echo "--- scan_runner exited code=$EXIT_CODE $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> "$LOG_FILE"
 echo "--- scan_runner exited code=$EXIT_CODE $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> "$LOG_FILE"
 exit $EXIT_CODE

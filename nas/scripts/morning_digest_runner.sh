@@ -30,7 +30,13 @@ HC="$TRADING_DIR/nas/scripts/healthcheck.sh"
 # Backfill live option contracts — the 9:45 scan can precede settled options pricing.
 "$PYTHON" reprice.py    >> "$LOG_FILE" 2>&1 || true
 "$PYTHON" notify.py --morning-digest --channel email >> "$LOG_FILE" 2>&1
-
 EXIT_CODE=$?
+
+# Submit paper orders immediately (Alpaca-priced if the scan couldn't price them),
+# so a fill lands within minutes of the alert. No-op unless alpaca.enabled=true.
+# The standalone 10:06 cron submit remains an idempotent retry.
+"$PYTHON" paper_broker.py submit >> "$TRADING_DIR/logs/paper_broker.log" 2>&1 || true
+
+echo "--- morning_digest_runner exited code=$EXIT_CODE $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> "$LOG_FILE"
 echo "--- morning_digest_runner exited code=$EXIT_CODE $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> "$LOG_FILE"
 exit $EXIT_CODE

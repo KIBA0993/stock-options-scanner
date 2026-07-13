@@ -98,6 +98,8 @@
     "qty": 1,
     "hold_trading_days": 5,
     "intraday_enabled": true,
-    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py. hold_trading_days = swing sessions to hold before auto sell-to-close (defaults to the largest validation horizon). intraday_enabled mirrors the 0DTE alert stream (buy on entry alert, sell on exit alert / EOD); set false to paper-trade swing only."
+    "price_via_alpaca": true,
+    "max_spread_pct": 50,
+    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py. hold_trading_days = swing sessions to hold before auto sell-to-close (defaults to the largest validation horizon). intraday_enabled mirrors the 0DTE alert stream (buy on entry alert, sell on exit alert / EOD); set false to paper-trade swing only. price_via_alpaca = when the scan couldn't price a contract, pick+price one off Alpaca's live indicative feed so the paper order fires within minutes of the alert (max_spread_pct caps the bid/ask spread accepted)."
   }
 }

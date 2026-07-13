@@ -418,3 +418,116 @@ class TestIntradaySubmitDryRun:
         r = pb.submit_intraday(config=cfg, dry_run=True)
         assert r["submitted"] == 1                                       # only the QQQ entry
         assert r["skipped"] == 1
+
+
+# ─── Alpaca-side contract pricing (Option A) ─────────────────────────────────────
+class TestDteAndOcc:
+    def test_parse_dte_window(self):
+        assert pb._parse_dte_window({"options": {"preferred_dte": "7-14 days"}}) == (7, 14)
+        assert pb._parse_dte_window({"options": {"preferred_dte": "10 days"}}) == (10, 10)
+        assert pb._parse_dte_window({}) == (7, 14)
+
+    def test_parse_occ_roundtrip(self):
+        occ = pb.build_occ_symbol("IWM", "2026-07-23", "put", 298.0)
+        assert occ == "IWM260723P00298000"
+        exp, cp, strike = pb._parse_occ(occ)
+        assert (exp, cp, strike) == ("2026-07-23", "P", 298.0)
+
+
+class TestSelectAlpacaContract:
+    def _snaps(self):
+        return [
+            {"strike": 298.0, "expiration": "2026-07-23", "bid": 4.55, "ask": 4.78},  # ATM-ish
+            {"strike": 290.0, "expiration": "2026-07-23", "bid": 2.00, "ask": 2.10},  # further OTM
+            {"strike": 350.0, "expiration": "2026-07-23", "bid": 9.00, "ask": 9.20},  # >15% away
+            {"strike": 296.0, "expiration": "2026-07-23", "bid": 1.00, "ask": 3.00},  # spread too wide
+        ]
+
+    def test_picks_nearest_atm_within_budget(self):
+        c = pb.select_alpaca_contract(295.42, self._snaps(), "put", budget=500, max_spread_pct=50)
+        t = c["tiers"]["atm"]
+        assert t["strike"] == 298.0                       # closest to 295.42 among valid
+        assert t["mid_price"] == 4.67                      # round((4.55+4.78)/2, 2)
+        assert t["source"] == "alpaca_indicative"
+
+    def test_excludes_wide_spread_and_far_strikes(self):
+        # tighten spread cap so 296 (100% spread) is gone; 350 excluded by 15% window
+        c = pb.select_alpaca_contract(295.42, self._snaps(), "put", budget=500, max_spread_pct=10)
+        strikes_considered = {298.0, 290.0}
+        assert c["tiers"]["atm"]["strike"] in strikes_considered
+
+    def test_falls_back_to_cheapest_when_none_in_budget(self):
+        # budget below every contract's cost → still returns nearest-ATM (no skip)
+        c = pb.select_alpaca_contract(295.42, self._snaps(), "put", budget=10, max_spread_pct=50)
+        assert c is not None
+        assert c["tiers"]["atm"]["strike"] == 298.0
+
+    def test_none_when_no_valid_contracts(self):
+        assert pb.select_alpaca_contract(100.0, [], "put") is None
+        one_sided = [{"strike": 100, "expiration": "2026-07-23", "bid": 0, "ask": 1.0}]
+        assert pb.select_alpaca_contract(100.0, one_sided, "put") is None
+
+
+class TestEnsurePricedContract:
+    def _priced(self):
+        return {"symbol": "NVDA", "direction": "call", "recommended_contract": {"tiers": {"atm": {
+            "strike": 100, "expiration": "2026-07-24", "mid_price": 2.0, "ask": 2.1}}}}
+
+    def _unpriced(self):
+        return {"symbol": "IWM", "direction": "put",
+                "recommended_contract": {"tiers": None, "notes": "no liquid options"}}
+
+    def test_keeps_scan_priced_contract(self, monkeypatch):
+        monkeypatch.setattr(pb, "price_contract_via_alpaca",
+                            lambda *a, **k: pytest.fail("must not call Alpaca when already priced"))
+        alert, src = pb.ensure_priced_contract(self._priced(), {"alpaca": {}})
+        assert src == "scan"
+
+    def test_prices_via_alpaca_when_unpriced(self, monkeypatch):
+        built = {"tiers": {"atm": {"strike": 298, "expiration": "2026-07-23",
+                                   "mid_price": 4.66, "ask": 4.78, "source": "alpaca_indicative"}}}
+        monkeypatch.setattr(pb, "price_contract_via_alpaca", lambda s, d, c: built)
+        alert, src = pb.ensure_priced_contract(self._unpriced(), {"alpaca": {}})
+        assert src == "alpaca"
+        assert alert["recommended_contract"] is built
+
+    def test_gate_off_skips_alpaca(self, monkeypatch):
+        monkeypatch.setattr(pb, "price_contract_via_alpaca",
+                            lambda *a, **k: pytest.fail("gate off — must not call Alpaca"))
+        _, src = pb.ensure_priced_contract(self._unpriced(), {"alpaca": {"price_via_alpaca": False}})
+        assert src == "unpriced"
+
+    def test_unpriced_when_alpaca_returns_none(self, monkeypatch):
+        monkeypatch.setattr(pb, "price_contract_via_alpaca", lambda s, d, c: None)
+        _, src = pb.ensure_priced_contract(self._unpriced(), {"alpaca": {}})
+        assert src == "unpriced"
+
+
+class TestSubmitUsesAlpacaPricing:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        data = tmp_path / "data"; paper = data / "paper"; paper.mkdir(parents=True)
+        monkeypatch.setattr(pb, "DATA_DIR", data)
+        monkeypatch.setattr(pb, "PAPER_DIR", paper)
+        monkeypatch.setattr(pb, "ORDERS_PATH", paper / "paper_orders.jsonl")
+        monkeypatch.setattr(pb, "ALERTS_PATH", data / "alerts.json")
+        (data / "alerts.json").write_text(json.dumps({
+            "scan_timestamp": "2026-07-13T13:46:00+00:00",
+            "alerts": [{"symbol": "IWM", "direction": "put", "score": 0.8,
+                        "recommended_contract": {"tiers": None}}]}))
+        return tmp_path
+
+    def test_unpriced_alert_gets_alpaca_priced_and_submitted(self, env, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("dry-run must not build client"))
+        built = {"tiers": {"atm": {"strike": 298, "expiration": "2026-07-23",
+                                   "mid_price": 4.66, "ask": 4.78, "source": "alpaca_indicative"}}}
+        monkeypatch.setattr(pb, "price_contract_via_alpaca", lambda s, d, c: built)
+        cfg = {"alpaca": {"enabled": True, "paper": True,
+                          "base_url": "https://paper-api.alpaca.markets"}}
+        r = pb.submit_alerts(config=cfg, dry_run=True)
+        assert r["submitted"] == 1
+        assert r["alpaca_priced"] == 1
+        o = r["orders"][0]
+        assert o["occ_symbol"] == "IWM260723P00298000"
+        assert o["contract_source"] == "alpaca"
+        assert o["limit_price"] == 4.78                    # buys at the Alpaca ask

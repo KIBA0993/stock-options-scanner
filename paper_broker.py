@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -355,6 +356,145 @@ def _to_alpaca_request(order: dict):
     return MarketOrderRequest(**common)
 
 
+# ─── Alpaca-side contract pricing (Option A) ─────────────────────────────────────
+# When the scan couldn't price a contract (yfinance chain empty at the open), price
+# it directly off Alpaca — the same broker we trade through — so a paper order can
+# fire within minutes of the alert instead of waiting for the 10:05 yfinance reprice.
+# Uses the free INDICATIVE options feed (OPRA requires a signed agreement).
+
+def _stock_data_client(cfg: dict):
+    from alpaca.data.historical.stock import StockHistoricalDataClient
+    return StockHistoricalDataClient(cfg["api_key_id"], cfg["api_secret_key"])
+
+
+def _option_data_client(cfg: dict):
+    from alpaca.data.historical.option import OptionHistoricalDataClient
+    return OptionHistoricalDataClient(cfg["api_key_id"], cfg["api_secret_key"])
+
+
+def _parse_dte_window(config: dict) -> tuple[int, int]:
+    """(low, high) DTE days from options.preferred_dte like '7-14 days'."""
+    raw = str((config.get("options") or {}).get("preferred_dte", "7-14"))
+    nums = [int(n) for n in re.findall(r"\d+", raw)]
+    if len(nums) >= 2:
+        return min(nums[0], nums[1]), max(nums[0], nums[1])
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    return 7, 14
+
+
+def _dte_window_dates(config: dict) -> tuple[str, str]:
+    lo, hi = _parse_dte_window(config)
+    today = date.today()
+    return (today + timedelta(days=lo)).isoformat(), (today + timedelta(days=hi)).isoformat()
+
+
+def _parse_occ(occ: str) -> tuple[str, str, float]:
+    """Reverse of build_occ_symbol → (expiration_iso, 'C'|'P', strike)."""
+    strike = int(occ[-8:]) / 1000.0
+    cp = occ[-9]
+    ymd = occ[-15:-9]
+    exp = f"20{ymd[0:2]}-{ymd[2:4]}-{ymd[4:6]}"
+    return exp, cp, strike
+
+
+def alpaca_underlying_price(symbol: str, cfg: dict) -> Optional[float]:
+    from alpaca.data.requests import StockLatestTradeRequest
+    client = _stock_data_client(cfg)
+    resp = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
+    trade = resp.get(symbol)
+    return float(trade.price) if trade and getattr(trade, "price", None) else None
+
+
+def alpaca_option_snapshots(symbol: str, direction: str, lo_date: str, hi_date: str,
+                            cfg: dict) -> list[dict]:
+    """Live [{strike, expiration, bid, ask}] for the underlying's calls/puts in the
+    DTE window, via the indicative feed."""
+    from alpaca.data.requests import OptionChainRequest
+    from alpaca.data.enums import OptionsFeed
+    client = _option_data_client(cfg)
+    req = OptionChainRequest(
+        underlying_symbol=symbol, type=direction, feed=OptionsFeed.INDICATIVE,
+        expiration_date_gte=lo_date, expiration_date_lte=hi_date,
+    )
+    chain = client.get_option_chain(req)
+    snaps = []
+    for occ, snap in chain.items():
+        q = getattr(snap, "latest_quote", None)
+        if not q:
+            continue
+        bid = float(getattr(q, "bid_price", 0) or 0)
+        ask = float(getattr(q, "ask_price", 0) or 0)
+        exp, _cp, strike = _parse_occ(occ)
+        snaps.append({"occ": occ, "strike": strike, "expiration": exp, "bid": bid, "ask": ask})
+    return snaps
+
+
+def select_alpaca_contract(underlying: Optional[float], snaps: list[dict], direction: str,
+                           budget: float = 500.0, max_spread_pct: float = 50.0) -> Optional[dict]:
+    """Pure: pick the nearest-ATM two-sided contract in the earliest expiration,
+    preferring one that fits budget. Returns a recommended_contract-shaped dict."""
+    valid = []
+    for s in snaps:
+        bid, ask = s.get("bid") or 0, s.get("ask") or 0
+        if ask <= 0 or bid <= 0:
+            continue
+        mid = round((bid + ask) / 2, 2)
+        if mid <= 0:
+            continue
+        if (ask - bid) / mid * 100 > max_spread_pct:
+            continue
+        if underlying and abs(s["strike"] - underlying) / underlying > 0.15:
+            continue
+        valid.append({**s, "mid": mid})
+    if not valid:
+        return None
+    exp = min(v["expiration"] for v in valid)                 # earliest expiration in window
+    valid = [v for v in valid if v["expiration"] == exp]
+    in_budget = [v for v in valid if v["mid"] * 100 <= budget]
+    pool = in_budget or valid                                  # fall back to cheapest if none fit
+    anchor = underlying if underlying else min(v["strike"] for v in pool)
+    pick = min(pool, key=lambda v: abs(v["strike"] - anchor))
+    return {"tiers": {"atm": {
+        "strike": pick["strike"], "expiration": pick["expiration"], "direction": direction,
+        "bid": pick["bid"], "ask": pick["ask"], "mid_price": pick["mid"],
+        "cost_per_contract": round(pick["mid"] * 100, 2), "source": "alpaca_indicative",
+    }}}
+
+
+def price_contract_via_alpaca(symbol: str, direction: str,
+                              config: Optional[dict] = None) -> Optional[dict]:
+    """Build a priced recommended_contract off Alpaca live quotes, or None."""
+    config = config or load_config()
+    cfg = alpaca_cfg(config)
+    try:
+        underlying = alpaca_underlying_price(symbol, cfg)
+        lo, hi = _dte_window_dates(config)
+        snaps = alpaca_option_snapshots(symbol, direction.lower(), lo, hi, cfg)
+    except Exception as exc:
+        logger.warning(f"alpaca pricing failed {symbol} {direction}: {exc}")
+        return None
+    budget = float((config.get("budget") or {}).get("total_usd", 500) or 500)
+    max_spread = float(cfg.get("max_spread_pct", 50))
+    contract = select_alpaca_contract(underlying, snaps, direction.lower(), budget, max_spread)
+    if not contract:
+        logger.info(f"alpaca pricing: no tradeable contract for {symbol} {direction}")
+    return contract
+
+
+def ensure_priced_contract(alert: dict, config: dict) -> tuple[dict, str]:
+    """Return (alert, source): keep the scan's priced contract if present, else price
+    it off Alpaca. source ∈ {'scan','alpaca','unpriced'}."""
+    if _pick_tier(alert):
+        return alert, "scan"
+    if not alpaca_cfg(config).get("price_via_alpaca", True):
+        return alert, "unpriced"
+    rc = price_contract_via_alpaca(alert.get("symbol", ""), alert.get("direction", ""), config)
+    if rc:
+        return {**alert, "recommended_contract": rc}, "alpaca"
+    return alert, "unpriced"
+
+
 # ─── Submit ─────────────────────────────────────────────────────────────────────
 def submit_alerts(config: Optional[dict] = None, dry_run: bool = False) -> dict:
     """
@@ -376,19 +516,23 @@ def submit_alerts(config: Optional[dict] = None, dry_run: bool = False) -> dict:
 
     already = _submitted_occ_today()
     client = None if dry_run else _client(cfg)
-    submitted, skipped, records = 0, 0, []
+    submitted, skipped, alpaca_priced, records = 0, 0, 0, []
 
     for alert in alerts:
+        alert, price_src = ensure_priced_contract(alert, config)
+        if price_src == "alpaca":
+            alpaca_priced += 1
         order = alert_to_order(alert, scan_date=scan_date, qty=qty)
         if not order:
             skipped += 1
-            logger.info(f"skip {alert.get('symbol')} — no priced contract")
+            logger.info(f"skip {alert.get('symbol')} — no priced contract (scan + Alpaca both empty)")
             continue
         if order["occ_symbol"] in already:
             skipped += 1
             logger.info(f"skip {order['occ_symbol']} — already submitted today")
             continue
 
+        order["contract_source"] = price_src
         rec = {**order, "submitted_at": _now(), "status": "dry_run" if dry_run else "submitted"}
         if not dry_run:
             try:
@@ -408,7 +552,7 @@ def submit_alerts(config: Optional[dict] = None, dry_run: bool = False) -> dict:
         _append_orders(records)
 
     return {"enabled": True, "submitted": submitted, "skipped": skipped,
-            "dry_run": dry_run, "orders": records}
+            "alpaca_priced": alpaca_priced, "dry_run": dry_run, "orders": records}
 
 
 # ─── Exit (sell-to-close past the hold window) ───────────────────────────────────
@@ -827,7 +971,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("alpaca.enabled is false — add paper keys to config.json first.")
         else:
             tag = "[dry-run] " if r.get("dry_run") else ""
-            print(f"{tag}submitted {r['submitted']}, skipped {r['skipped']}.")
+            extra = f" ({r['alpaca_priced']} Alpaca-priced)" if r.get("alpaca_priced") else ""
+            print(f"{tag}submitted {r['submitted']}, skipped {r['skipped']}{extra}.")
         return 0
     if args.command == "exit":
         r = exit_positions(dry_run=args.dry_run)
