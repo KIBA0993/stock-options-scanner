@@ -1056,8 +1056,13 @@ def run_scan(config: dict, symbols: list[str], dry_run: bool = False) -> list[di
             sym = entry["symbol"].upper()
             hold_min = minutes_since_entry(entry)
             hold_blocked = hold_min < exit_min_hold
+            # Populate the two caches independently: flip_exits_for_new_entries()
+            # above may have seeded bars_cache[sym] without options_cache[sym],
+            # so a shared `sym not in bars_cache` guard would leave options_cache
+            # unset and KeyError below.
             if sym not in bars_cache:
                 bars_cache[sym] = fetch_intraday_bars(sym)
+            if sym not in options_cache:
                 options_cache[sym] = fetch_0dte_options(sym, dte_max=dte_max)
             bars = bars_cache[sym]
             options = options_cache[sym]

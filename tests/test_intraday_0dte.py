@@ -212,6 +212,42 @@ class TestExitAlerts:
         ex = i0.build_eod_exit(entry, bars, {"eod_exit_time": "15:45"})
         assert ex["exit_reason"] == "eod_exit"
 
+    def test_run_scan_survives_cache_desync(self, tmp_trading, monkeypatch):
+        """Regression: flip_exits_for_new_entries seeds bars_cache[sym] without
+        options_cache[sym]; the exit loop must still populate options_cache and
+        not KeyError when the same symbol has an open position to monitor."""
+        open_pos = {
+            "symbol": "QQQ", "direction": "call",
+            "scan_timestamp": "2026-06-17T10:00:00-04:00",
+            "recommended_contract": {"tiers": {"atm": {
+                "strike": 480, "expiration": "2026-06-17", "mid_price": 1.2}}},
+        }
+        monkeypatch.setattr(i0, "is_trading_day", lambda *a, **k: True)
+        monkeypatch.setattr(i0, "is_market_hours", lambda *a, **k: True)
+        monkeypatch.setattr(i0, "minutes_since_open", lambda *a, **k: 60.0)
+        monkeypatch.setattr(i0, "fetch_intraday_bars", lambda s: _make_bars())
+        monkeypatch.setattr(i0, "fetch_0dte_options", lambda s, dte_max=1: {"calls": [], "puts": []})
+        monkeypatch.setattr(i0, "score_symbol", lambda symbol, bars, options, cfg: {
+            "symbol": symbol, "direction": "call", "score": 0.9,
+            "underlying_price": 100.0, "key_signals": [], "skip_reason": None})
+        monkeypatch.setattr(i0, "pick_option_contract", lambda **k: {"tiers": {"atm": {
+            "strike": 480, "expiration": "2026-06-17", "mid_price": 1.2, "ask": 1.3}}})
+        monkeypatch.setattr(i0, "should_fire_alert", lambda *a, **k: True)
+        monkeypatch.setattr(i0, "load_open_positions", lambda *a, **k: [open_pos])
+        monkeypatch.setattr(i0, "attach_exit_option_mid", lambda entry, exit_alert: exit_alert)
+
+        config = {"intraday_0dte": {
+            "or_wait_minutes": 0, "min_score": 0.5, "max_alerts_per_run": 2,
+            "flip_exit_on_opposite_entry": True, "exit_alerts_enabled": True,
+            "eod_exit_enabled": True, "eod_exit_time": "00:00",   # force EOD path
+            "email_alerts_enabled": False}, "budget": {"total_usd": 500}}
+
+        # Pre-fix this raised KeyError: 'QQQ'.
+        result = i0.run_scan(config, ["QQQ"], dry_run=True)
+        actions = {(a["symbol"], a.get("alert_action")) for a in result}
+        assert ("QQQ", "entry") in actions
+        assert any(act == "exit" for _, act in actions)   # EOD exit for the open position
+
     def test_flip_exit_on_opposite_entry(self, tmp_trading, monkeypatch):
         monkeypatch.setattr(
             i0, "date",
