@@ -295,6 +295,57 @@ class TestPaperFillOverride:
         assert h1["entry_source"] == "mid"
         assert "paper_fill_price" not in h1
 
+    def test_exit_fill_overrides_longest_horizon_pnl(self, tmp_env, monkeypatch):
+        _, arch, valid = tmp_env
+        _write_archive(arch, "scored-20260601-0943.json", "2026-06-01T13:43:00+00:00",
+                       [_alert("NVDA", "call", mid=2.0)])
+        v.cmd_snapshot(_ns())
+        monkeypatch.setattr(v, "underlying_close_on",
+                            lambda sym, d: 100.0 if d == date(2026, 6, 1) else 105.0)
+        # Modeled exit mid would give +10%; the real round trip must win instead.
+        monkeypatch.setattr(v, "fetch_swing_option_outcome",
+                            lambda *a, **k: {"outcome_option_pnl_pct": 10.0, "entry_mid": 2.0, "exit_mid": 2.2})
+        # entry 2.0 → exit 3.0 = +50% realized round trip
+        fills = {"NVDA:call:2026-06-01": {"entry_fill": 2.0, "exit_fill": 3.0, "entry_mid": 2.0}}
+        monkeypatch.setattr(v, "load_paper_fills", lambda: fills)
+        v.cmd_mark(_ns())
+
+        oc = v.load_outcomes()["NVDA:call:2026-06-01"]
+        assert oc["exit_source"] == "paper_fill"
+        assert oc["round_trip_pnl_pct"] == 50.0
+        h5 = oc["horizons"]["h5"]                     # longest = held-to-exit bucket
+        assert h5["option_pnl_pct"] == 50.0
+        assert h5["option_pnl_source"] == "round_trip_paper_fill"
+        assert h5["exit_source"] == "paper_fill"
+        assert h5["paper_exit_price"] == 3.0
+        # interim horizon keeps the modeled mark (position still open then)
+        h1 = oc["horizons"]["h1"]
+        assert h1["option_pnl_pct"] == 10.0
+        assert "exit_source" not in h1
+
+    def test_exit_fill_reopens_final_prediction(self, tmp_env, monkeypatch):
+        """An exit fill arriving after entry was already marked re-opens it once."""
+        _, arch, valid = tmp_env
+        _write_archive(arch, "scored-20260601-0943.json", "2026-06-01T13:43:00+00:00",
+                       [_alert("NVDA", "call", mid=2.0)])
+        v.cmd_snapshot(_ns())
+        monkeypatch.setattr(v, "underlying_close_on",
+                            lambda sym, d: 100.0 if d == date(2026, 6, 1) else 105.0)
+        monkeypatch.setattr(v, "fetch_swing_option_outcome",
+                            lambda *a, **k: {"outcome_option_pnl_pct": 10.0, "entry_mid": 2.0, "exit_mid": 2.2})
+        # First pass: entry fill only.
+        monkeypatch.setattr(v, "load_paper_fills",
+                            lambda: {"NVDA:call:2026-06-01": {"entry_fill": 2.0, "entry_mid": 2.0}})
+        v.cmd_mark(_ns())
+        assert v.load_outcomes()["NVDA:call:2026-06-01"].get("exit_source") is None
+        # Second pass (no --force): exit fill lands → prediction re-opens and closes.
+        monkeypatch.setattr(v, "load_paper_fills",
+                            lambda: {"NVDA:call:2026-06-01": {"entry_fill": 2.0, "exit_fill": 2.5, "entry_mid": 2.0}})
+        v.cmd_mark(_ns())
+        oc = v.load_outcomes()["NVDA:call:2026-06-01"]
+        assert oc["exit_source"] == "paper_fill"
+        assert oc["round_trip_pnl_pct"] == 25.0
+
 
 # ─── HTML scorecard ─────────────────────────────────────────────────────────────
 class TestHtmlScorecard:

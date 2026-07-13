@@ -164,3 +164,114 @@ class TestDedup:
             json.dumps({"occ_symbol": "ASTH260717P00050000", "submitted_at": today + "T14:00:00Z"}) + "\n"
             + json.dumps({"occ_symbol": "OLD260101C00100000", "submitted_at": "2020-01-01T14:00:00Z"}) + "\n")
         assert pb._submitted_occ_today() == {"ASTH260717P00050000"}
+
+
+# ─── exit order builder (pure) ───────────────────────────────────────────────────
+class TestBuildExitOrder:
+    def test_sell_to_close_market(self):
+        entry = {"occ_symbol": "NVDA260717C00200000", "underlying": "NVDA",
+                 "direction": "call", "strike": 200.0, "expiration": "2026-07-17",
+                 "qty": 2, "entry_mid": 0.92, "order_id": "o1",
+                 "prediction_id": "NVDA:call:2026-07-02"}
+        x = pb.build_exit_order(entry)
+        assert x["side"] == "sell"
+        assert x["type"] == "market"
+        assert x["limit_price"] is None
+        assert x["qty"] == 2
+        assert x["closes_prediction_id"] == "NVDA:call:2026-07-02"
+        assert x["entry_order_id"] == "o1"
+
+    def test_qty_override(self):
+        entry = {"occ_symbol": "X", "qty": 5, "prediction_id": "X:call:2026-07-02"}
+        assert pb.build_exit_order(entry, qty=1)["qty"] == 1
+
+
+# ─── hold-window helpers ─────────────────────────────────────────────────────────
+class TestHoldWindow:
+    def test_hold_days_defaults_to_max_horizon(self):
+        assert pb._hold_trading_days({"validation": {"horizons_days": [1, 3, 5]}}) == 5
+
+    def test_hold_days_explicit_override(self):
+        assert pb._hold_trading_days({"alpaca": {"hold_trading_days": 2}}) == 2
+
+    def test_entry_date_from_prediction_id(self):
+        assert pb._entry_date_of({"prediction_id": "NVDA:call:2026-07-02"}) == date(2026, 7, 2)
+
+    def test_entry_date_fallback_to_submitted_at(self):
+        assert pb._entry_date_of({"submitted_at": "2026-07-02T14:00:00Z"}) == date(2026, 7, 2)
+
+    def test_add_trading_days_skips_weekend(self):
+        # Fri 2026-07-10 + 1 trading day = Mon 2026-07-13
+        assert pb._add_trading_days(date(2026, 7, 10), 1) == date(2026, 7, 13)
+
+
+# ─── exit selection (dry-run, no SDK) ────────────────────────────────────────────
+class TestExitPositions:
+    @pytest.fixture
+    def orders_env(self, tmp_path, monkeypatch):
+        paper = tmp_path / "paper"; paper.mkdir(parents=True)
+        monkeypatch.setattr(pb, "PAPER_DIR", paper)
+        monkeypatch.setattr(pb, "ORDERS_PATH", paper / "paper_orders.jsonl")
+        today = date.today().isoformat()
+        rows = [
+            # held long ago → due for exit
+            {"side": "buy", "occ_symbol": "AAA260717C00100000", "qty": 1,
+             "order_id": "oA", "prediction_id": "AAA:call:2000-01-01"},
+            # entered today → still inside the 5-session hold window
+            {"side": "buy", "occ_symbol": "BBB260717C00100000", "qty": 1,
+             "order_id": "oB", "prediction_id": f"BBB:call:{today}"},
+            # held long ago but already has a sell order → skip
+            {"side": "buy", "occ_symbol": "CCC260717C00100000", "qty": 1,
+             "order_id": "oC", "prediction_id": "CCC:call:2000-01-01"},
+            {"side": "sell", "occ_symbol": "CCC260717C00100000",
+             "order_id": "oCx", "closes_prediction_id": "CCC:call:2000-01-01"},
+        ]
+        (paper / "paper_orders.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return paper
+
+    def test_dry_run_selects_only_due_unclosed(self, orders_env, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("dry-run must not build client"))
+        cfg = {"alpaca": {"enabled": True, "paper": True,
+                          "base_url": "https://paper-api.alpaca.markets"}}
+        r = pb.exit_positions(config=cfg, dry_run=True)
+        assert r["exited"] == 1
+        occs = {o["occ_symbol"] for o in r["orders"]}
+        assert occs == {"AAA260717C00100000"}
+        assert r["orders"][0]["side"] == "sell"
+        # nothing persisted on dry-run
+        assert not (orders_env / "paper_orders.jsonl").read_text().count('"dry_run"')
+
+    def test_noops_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(pb, "_client", lambda cfg: pytest.fail("must not build client"))
+        r = pb.exit_positions(config={"alpaca": {"enabled": False}})
+        assert r == {"enabled": False, "exited": 0, "skipped": 0}
+
+
+# ─── reconcile with exit legs (pure) ─────────────────────────────────────────────
+class TestReconcileExits:
+    def test_folds_exit_fill_and_round_trip_pnl(self):
+        orders = [
+            {"side": "buy", "order_id": "o1", "prediction_id": "NVDA:call:2026-07-02",
+             "occ_symbol": "NVDA260717C00200000", "entry_mid": 0.92},
+            {"side": "sell", "order_id": "o2", "closes_prediction_id": "NVDA:call:2026-07-02",
+             "occ_symbol": "NVDA260717C00200000"},
+        ]
+        status = {
+            "o1": {"filled_avg_price": 1.00, "status": "filled", "filled_at": "t1"},
+            "o2": {"filled_avg_price": 1.50, "status": "filled", "filled_at": "t2"},
+        }
+        f = pb.reconcile(orders, status)["NVDA:call:2026-07-02"]
+        assert f["entry_fill"] == 1.00
+        assert f["exit_fill"] == 1.50
+        assert f["round_trip_pnl_pct"] == 50.0            # (1.5-1.0)/1.0
+
+    def test_exit_without_entry_fill_has_no_round_trip(self):
+        orders = [
+            {"side": "sell", "order_id": "o2", "closes_prediction_id": "NVDA:call:2026-07-02",
+             "occ_symbol": "NVDA260717C00200000"},
+        ]
+        status = {"o2": {"filled_avg_price": 1.50, "status": "filled"}}
+        f = pb.reconcile(orders, status)["NVDA:call:2026-07-02"]
+        assert f["exit_fill"] == 1.50
+        assert "round_trip_pnl_pct" not in f
+        assert "entry_fill" not in f

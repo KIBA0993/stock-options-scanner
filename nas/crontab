@@ -18,6 +18,10 @@
 # 12:48 PM — submit midday alerts as PAPER orders (dedups vs morning)
 48 12 * * 1-5 /data/trading/nas/scripts/paper_runner.sh submit
 
+# 3:45 PM — sell-to-close paper positions past their hold window (before the close;
+# 4:30 validate_runner then syncs the exit fills into the scorecard)
+45 15 * * 1-5 /data/trading/nas/scripts/paper_runner.sh exit
+
 # 0–1 DTE intraday — every 10 min on trading days
 40,50 9 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh
 */10 10-14 * * 1-5 /data/trading/nas/scripts/run_if_market_open.sh /data/trading/nas/scripts/intraday_0dte_runner.sh

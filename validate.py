@@ -329,6 +329,17 @@ def _mark_one(snap: dict, horizons: list[int], config: dict,
         if mid:
             fill_slippage_pct = round((float(fill["entry_fill"]) - float(mid)) / float(mid) * 100, 2)
 
+    # A real sell-to-close fill closes the round trip: option P&L becomes the
+    # realized entry_fill → exit_fill, not a modeled exit mid. Applied to the
+    # longest horizon (the held-to-exit bucket).
+    realized_pnl: Optional[float] = None
+    exit_fill_price: Optional[float] = None
+    if (fill and has_contract and fill.get("entry_fill") and fill.get("exit_fill")):
+        entry_fill_price = float(fill["entry_fill"])
+        exit_fill_price = float(fill["exit_fill"])
+        if entry_fill_price > 0:
+            realized_pnl = round((exit_fill_price - entry_fill_price) / entry_fill_price * 100, 2)
+
     # Reconstruct an alert-like dict for option_outcome (uses recommended_contract.tiers)
     alert_like = {
         "symbol": symbol,
@@ -383,6 +394,18 @@ def _mark_one(snap: dict, horizons: list[int], config: dict,
 
         per_h[f"h{h}"] = row
 
+    # Overlay the realized round-trip P&L on the held-to-exit (longest) horizon.
+    exit_source: Optional[str] = None
+    if realized_pnl is not None and horizons:
+        hkey = f"h{max(horizons)}"
+        exit_row = per_h.get(hkey)
+        if exit_row is not None:
+            exit_row["option_pnl_pct"] = realized_pnl
+            exit_row["option_pnl_source"] = "round_trip_paper_fill"
+            exit_row["exit_source"] = "paper_fill"
+            exit_row["paper_exit_price"] = exit_fill_price
+            exit_source = "paper_fill"
+
     return {
         "prediction_id": snap["prediction_id"],
         "symbol":        symbol,
@@ -391,6 +414,8 @@ def _mark_one(snap: dict, horizons: list[int], config: dict,
         "has_contract":  has_contract,
         "horizons":      per_h,
         "all_final":     all_final,
+        "exit_source":   exit_source,
+        "round_trip_pnl_pct": realized_pnl,
         "marked_at":     datetime.now(timezone.utc).isoformat(),
     }
 
@@ -415,9 +440,14 @@ def cmd_mark(args: argparse.Namespace) -> int:
             h.get("entry_source") == "paper_fill"
             for h in (prev.get("horizons") or {}).values()
         ))
+        prev_used_exit = bool(prev and prev.get("exit_source") == "paper_fill")
+        new_has_exit = bool(fills.get(pid, {}).get("exit_fill"))
         # A newly-arrived paper fill re-opens an otherwise-final prediction once,
-        # so its option P&L can switch from the assumed mid to the real fill.
-        needs_fill_update = (pid in fills) and not prev_used_fill
+        # so its option P&L can switch from the assumed mid to the real fill —
+        # once for the entry leg, and again when the exit (sell) fill lands.
+        needs_fill_update = (pid in fills) and (
+            not prev_used_fill or (new_has_exit and not prev_used_exit)
+        )
         if prev and prev.get("all_final") and not args.force and not needs_fill_update:
             skipped_final += 1
             continue
@@ -471,6 +501,11 @@ def _agg(rows: list[dict]) -> dict:
     slip = [r["fill_vs_mid_slippage_pct"] for r in paper
             if r.get("fill_vs_mid_slippage_pct") is not None]
 
+    # Closed round trips (real entry + real exit fill)
+    exited = [r for r in rows if r.get("exit_source") == "paper_fill"]
+    rt = [r["option_pnl_pct"] for r in exited if r.get("option_pnl_pct") is not None]
+    rt_wins = [p for p in rt if p > 0]
+
     return {
         "n":                 len(rows),
         "n_directional":     len(dir_known),
@@ -482,6 +517,9 @@ def _agg(rows: list[dict]) -> dict:
         "avg_option_pnl":    round(sum(opt) / len(opt), 1) if opt else None,
         "n_paper_fill":      len(paper),
         "avg_fill_slippage": round(sum(slip) / len(slip), 2) if slip else None,
+        "n_round_trip":      len(exited),
+        "round_trip_win_rate": round(100 * len(rt_wins) / len(rt), 1) if rt else None,
+        "avg_round_trip_pnl": round(sum(rt) / len(rt), 1) if rt else None,
     }
 
 
@@ -781,6 +819,13 @@ def cmd_report(args: argparse.Namespace) -> int:
             slip_s = f", avg fill slippage {slip:+.1f}% vs mid" if slip is not None else ""
             print(f"     option P&L on REAL paper fills: {ov['n_paper_fill']}/{ov['n_option']}"
                   f"{slip_s}")
+        if ov.get("n_round_trip"):
+            wr = ov.get("round_trip_win_rate")
+            avg = ov.get("avg_round_trip_pnl")
+            wr_s = f", win {wr:.0f}%" if wr is not None else ""
+            avg_s = f", avg {avg:+.1f}%" if avg is not None else ""
+            print(f"     CLOSED round trips (real entry+exit fills): "
+                  f"{ov['n_round_trip']}{wr_s}{avg_s}")
 
         if len(block["by_method"]) > 1 or block["by_method"]:
             print("     by scoring method:")

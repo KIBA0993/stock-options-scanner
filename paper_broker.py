@@ -29,10 +29,20 @@ Config (config.json)
 
 Requires `alpaca-py` (imported lazily) only when actually submitting/syncing.
 
+Exit policy
+-----------
+Entries are bought-to-open. `exit_positions()` sells-to-close each open paper
+position once it has been held `alpaca.hold_trading_days` NYSE sessions (default:
+the largest validation horizon, i.e. 5). Exits are market sell-to-close orders so
+they fill without a live quote feed; `sync_fills()` then captures the real exit
+fill and the round-trip P&L, which `validate.py` folds into the scorecard in
+place of the modeled exit mid.
+
 CLI
 ---
   python paper_broker.py submit [--dry-run]   # submit today's alerts.json as paper orders
-  python paper_broker.py sync                  # refresh fill status from Alpaca
+  python paper_broker.py exit   [--dry-run]   # sell-to-close positions past their hold window
+  python paper_broker.py sync                  # refresh entry+exit fills from Alpaca
   python paper_broker.py status                # show tracked paper orders + fills
 """
 
@@ -42,9 +52,11 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+from market_calendar import is_trading_day
 
 BASE_DIR      = Path.home() / "trading"
 DATA_DIR      = BASE_DIR / "data"
@@ -170,6 +182,33 @@ def alert_to_order(
     return order
 
 
+def build_exit_order(entry_order: dict, qty: Optional[int] = None) -> dict:
+    """
+    Map a tracked *entry* order to a sell-to-close order request (pure).
+
+    We sell-to-close at market so the paper fill lands without needing a live
+    option quote feed — realistic (fills near the bid) and dependency-free. The
+    order carries `closes_prediction_id` so sync_fills can reconcile the exit leg
+    back to the same ledger prediction as the entry.
+    """
+    q = int(qty if qty is not None else entry_order.get("qty", 1))
+    return {
+        "occ_symbol":          entry_order["occ_symbol"],
+        "underlying":          entry_order.get("underlying"),
+        "direction":           entry_order.get("direction"),
+        "strike":              entry_order.get("strike"),
+        "expiration":          entry_order.get("expiration"),
+        "qty":                 q,
+        "side":                "sell",
+        "type":                "market",
+        "limit_price":         None,
+        "time_in_force":       "day",
+        "entry_mid":           entry_order.get("entry_mid"),
+        "closes_prediction_id": entry_order.get("prediction_id"),
+        "entry_order_id":      entry_order.get("order_id"),
+    }
+
+
 # ─── Storage ────────────────────────────────────────────────────────────────────
 def load_orders() -> list[dict]:
     if not ORDERS_PATH.exists():
@@ -201,6 +240,68 @@ def _append_orders(records: list[dict]) -> None:
             f.write(json.dumps(r, default=str) + "\n")
 
 
+# ─── Hold window / exit selection ────────────────────────────────────────────────
+def _add_trading_days(start: date, n: int) -> date:
+    """The session `n` NYSE trading days after `start` (matches option_outcome)."""
+    d = start
+    added = 0
+    while added < n:
+        d += timedelta(days=1)
+        if is_trading_day(d):
+            added += 1
+    return d
+
+
+def _hold_trading_days(config: Optional[dict] = None) -> int:
+    """How many sessions to hold before selling to close. `alpaca.hold_trading_days`
+    if set, else the largest validation horizon (default 5)."""
+    config = config or load_config()
+    explicit = alpaca_cfg(config).get("hold_trading_days")
+    if explicit:
+        return int(explicit)
+    horizons = config.get("validation", {}).get("horizons_days") or [5]
+    return int(max(horizons))
+
+
+def _entry_date_of(order: dict) -> Optional[date]:
+    """Scan/entry date for a tracked entry order — from the prediction_id suffix,
+    falling back to the submit timestamp."""
+    pid = str(order.get("prediction_id") or "")
+    parts = pid.split(":")
+    ds = parts[-1] if len(parts) == 3 else str(order.get("submitted_at", ""))[:10]
+    try:
+        return date.fromisoformat(ds)
+    except ValueError:
+        return None
+
+
+def _closed_prediction_ids() -> set[str]:
+    """Predictions that already have a sell-to-close order recorded — for dedup."""
+    return {
+        o["closes_prediction_id"] for o in load_orders()
+        if str(o.get("side")) == "sell" and o.get("closes_prediction_id")
+    }
+
+
+def _open_positions(client) -> dict[str, int]:
+    """{occ_symbol: qty} of currently-open Alpaca paper positions."""
+    try:
+        positions = client.get_all_positions()
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning(f"positions lookup failed: {exc}")
+        return {}
+    out: dict[str, int] = {}
+    for p in positions:
+        sym = getattr(p, "symbol", None)
+        qty = getattr(p, "qty", None)
+        if sym:
+            try:
+                out[sym] = int(float(qty or 0))
+            except (TypeError, ValueError):
+                out[sym] = 0
+    return out
+
+
 # ─── Alpaca client (lazy) ───────────────────────────────────────────────────────
 def _client(cfg: dict):
     _assert_paper(cfg)
@@ -219,10 +320,11 @@ def _to_alpaca_request(order: dict):
     """Convert our order dict to an alpaca-py MarketOrderRequest/LimitOrderRequest."""
     from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
+    side = OrderSide.SELL if str(order.get("side")).lower() == "sell" else OrderSide.BUY
     common = dict(
         symbol=order["occ_symbol"],
         qty=order["qty"],
-        side=OrderSide.BUY,
+        side=side,
         time_in_force=TimeInForce.DAY,
     )
     if order["type"] == "limit":
@@ -286,55 +388,122 @@ def submit_alerts(config: Optional[dict] = None, dry_run: bool = False) -> dict:
             "dry_run": dry_run, "orders": records}
 
 
+# ─── Exit (sell-to-close past the hold window) ───────────────────────────────────
+def exit_positions(config: Optional[dict] = None, dry_run: bool = False) -> dict:
+    """
+    Sell-to-close every tracked entry that has been held `hold_trading_days`
+    NYSE sessions and is still open in the paper account. Idempotent: an entry
+    that already has a recorded sell order is skipped.
+    """
+    config = config or load_config()
+    if not is_enabled(config):
+        logger.info("alpaca.enabled is false — not exiting")
+        return {"enabled": False, "exited": 0, "skipped": 0}
+
+    cfg = alpaca_cfg(config)
+    _assert_paper(cfg)
+    hold_days = _hold_trading_days(config)
+    today = date.today()
+    closed = _closed_prediction_ids()
+
+    client = None if dry_run else _client(cfg)
+    positions = _open_positions(client) if client is not None else {}
+
+    exited, skipped, records = 0, 0, []
+    for o in load_orders():
+        if str(o.get("side", "buy")) != "buy":       # only close entry legs
+            continue
+        occ = o.get("occ_symbol")
+        pid = o.get("prediction_id")
+        if not occ:
+            continue
+        if pid and pid in closed:
+            skipped += 1
+            continue                                  # already has a sell order
+        entry_date = _entry_date_of(o)
+        if not entry_date or today < _add_trading_days(entry_date, hold_days):
+            skipped += 1
+            continue                                  # inside the hold window
+        held_qty = positions.get(occ)
+        if not dry_run and not held_qty:
+            skipped += 1
+            logger.info(f"skip exit {occ} — no open position")
+            continue                                  # never filled / already gone
+
+        qty = int(held_qty) if held_qty else int(o.get("qty", 1))
+        exit_order = build_exit_order(o, qty=qty)
+        rec = {**exit_order, "submitted_at": _now(),
+               "status": "dry_run" if dry_run else "submitted"}
+        if not dry_run:
+            try:
+                resp = client.submit_order(_to_alpaca_request(exit_order))
+                rec["order_id"] = str(getattr(resp, "id", "") or "")
+                rec["status"] = str(getattr(resp, "status", "submitted"))
+            except Exception as exc:
+                rec["status"] = "error"
+                rec["error"] = str(exc)
+                logger.error(f"exit failed {occ}: {exc}")
+        records.append(rec)
+        exited += 1
+        if pid:
+            closed.add(pid)                           # guard duplicates within this run
+        logger.info(f"{'[dry-run] ' if dry_run else ''}exit {occ} {qty}x SELL market "
+                    f"(held ≥ {hold_days} sessions)")
+
+    if records and not dry_run:
+        _append_orders(records)
+
+    return {"enabled": True, "exited": exited, "skipped": skipped,
+            "dry_run": dry_run, "orders": records}
+
+
 # ─── Sync fills + reconcile to validator ────────────────────────────────────────
 def sync_fills(config: Optional[dict] = None) -> dict:
-    """Refresh fill status/price for tracked orders and write paper_fills.json
-    keyed by prediction_id for validate.py to consume."""
+    """Refresh entry+exit fill status/price for tracked orders and write
+    paper_fills.json keyed by prediction_id for validate.py to consume."""
     config = config or load_config()
     cfg = alpaca_cfg(config)
     _assert_paper(cfg)
     client = _client(cfg)
 
-    fills: dict[str, dict] = {}
-    updated = 0
-    for o in load_orders():
+    orders = load_orders()
+    order_status: dict[str, dict] = {}
+    for o in orders:
         oid = o.get("order_id")
-        pid = o.get("prediction_id")
-        if not oid:
+        if not oid or oid in order_status:
             continue
         try:
             resp = client.get_order_by_id(oid)
         except Exception as exc:
             logger.warning(f"order lookup failed {oid}: {exc}")
             continue
-        fill_price = getattr(resp, "filled_avg_price", None)
-        status = str(getattr(resp, "status", ""))
-        if fill_price and pid:
-            fills[pid] = {
-                "occ_symbol":  o["occ_symbol"],
-                "order_id":    oid,
-                "entry_fill":  float(fill_price),
-                "entry_mid":   o.get("entry_mid"),
-                "qty":         o.get("qty"),
-                "status":      status,
-                "filled_at":   str(getattr(resp, "filled_at", "") or ""),
-            }
-            updated += 1
+        order_status[oid] = {
+            "filled_avg_price": getattr(resp, "filled_avg_price", None),
+            "status":           str(getattr(resp, "status", "")),
+            "filled_at":        str(getattr(resp, "filled_at", "") or ""),
+        }
 
+    fills = reconcile(orders, order_status)
     if fills:
         PAPER_DIR.mkdir(parents=True, exist_ok=True)
         FILLS_PATH.write_text(json.dumps(fills, indent=2, default=str))
-    return {"orders": len(load_orders()), "filled": updated, "fills": fills}
+    n_entry = sum(1 for f in fills.values() if f.get("entry_fill") is not None)
+    n_exit = sum(1 for f in fills.values() if f.get("exit_fill") is not None)
+    return {"orders": len(orders), "filled": n_entry, "exits": n_exit, "fills": fills}
 
 
 def reconcile(orders: list[dict], order_status: dict[str, dict]) -> dict[str, dict]:
     """
     Pure reconciliation: given tracked orders and a {order_id: {filled_avg_price,
-    status, filled_at}} map (however obtained), return {prediction_id: fill_record}.
+    status, filled_at}} map (however obtained), return {prediction_id: fill_record}
+    carrying the entry leg and, once sold, the exit leg + round-trip P&L.
     Separated from the network call so it is fully testable offline.
     """
     fills: dict[str, dict] = {}
+    # Entry legs (buy-to-open).
     for o in orders:
+        if str(o.get("side", "buy")) != "buy":
+            continue
         oid = o.get("order_id")
         pid = o.get("prediction_id")
         st = order_status.get(oid or "")
@@ -348,11 +517,33 @@ def reconcile(orders: list[dict], order_status: dict[str, dict]) -> dict[str, di
             "order_id":   oid,
             "entry_fill": float(price),
             "entry_mid":  o.get("entry_mid"),
+            "qty":        o.get("qty"),
             "slippage_vs_mid": (round(float(price) - float(o["entry_mid"]), 2)
                                 if o.get("entry_mid") else None),
             "status":     st.get("status"),
             "filled_at":  st.get("filled_at"),
         }
+    # Exit legs (sell-to-close) — attach to the prediction they close.
+    for o in orders:
+        if str(o.get("side")) != "sell":
+            continue
+        oid = o.get("order_id")
+        pid = o.get("closes_prediction_id")
+        st = order_status.get(oid or "")
+        if not (oid and pid and st):
+            continue
+        price = st.get("filled_avg_price")
+        if price is None:
+            continue
+        rec = fills.get(pid, {"occ_symbol": o.get("occ_symbol")})
+        rec["exit_fill"] = float(price)
+        rec["exit_order_id"] = oid
+        rec["exit_status"] = st.get("status")
+        rec["exit_filled_at"] = st.get("filled_at")
+        entry = rec.get("entry_fill")
+        if entry:
+            rec["round_trip_pnl_pct"] = round((float(price) - float(entry)) / float(entry) * 100, 2)
+        fills[pid] = rec
     return fills
 
 
@@ -366,7 +557,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = p.add_subparsers(dest="command")
     s = sub.add_parser("submit", help="Submit today's alerts as paper orders")
     s.add_argument("--dry-run", action="store_true")
-    sub.add_parser("sync", help="Refresh fills from Alpaca")
+    e = sub.add_parser("exit", help="Sell-to-close positions past their hold window")
+    e.add_argument("--dry-run", action="store_true")
+    sub.add_parser("sync", help="Refresh entry+exit fills from Alpaca")
     sub.add_parser("status", help="Show tracked paper orders")
     args = p.parse_args(argv)
 
@@ -378,9 +571,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             tag = "[dry-run] " if r.get("dry_run") else ""
             print(f"{tag}submitted {r['submitted']}, skipped {r['skipped']}.")
         return 0
+    if args.command == "exit":
+        r = exit_positions(dry_run=args.dry_run)
+        if not r.get("enabled"):
+            print("alpaca.enabled is false — add paper keys to config.json first.")
+        else:
+            tag = "[dry-run] " if r.get("dry_run") else ""
+            print(f"{tag}exited {r['exited']}, skipped {r['skipped']}.")
+        return 0
     if args.command == "sync":
         r = sync_fills()
-        print(f"synced {r['filled']}/{r['orders']} order(s) with fills.")
+        print(f"synced {r['filled']} entry + {r['exits']} exit fill(s) "
+              f"across {r['orders']} order(s).")
         return 0
     if args.command == "status":
         orders = load_orders()

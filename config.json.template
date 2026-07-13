@@ -96,6 +96,7 @@
     "api_secret_key": "",
     "base_url": "https://paper-api.alpaca.markets",
     "qty": 1,
-    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py."
+    "hold_trading_days": 5,
+    "comment": "PAPER trading only (enforced in code). Add paper keys (start with PK) from alpaca.markets, set enabled=true. Requires: pip install alpaca-py. hold_trading_days = sessions to hold before auto sell-to-close (defaults to the largest validation horizon)."
   }
 }
